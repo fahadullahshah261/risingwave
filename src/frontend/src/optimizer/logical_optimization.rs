@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ use crate::optimizer::plan_visitor::{
 };
 use crate::optimizer::rule::*;
 use crate::utils::Condition;
-use crate::{Explain, OptimizerContextRef};
+use crate::{Binder, Explain, OptimizerContextRef, Planner};
 
 impl<C: ConventionMarker> PlanRef<C> {
     fn optimize_by_rules_inner(
@@ -107,9 +107,16 @@ impl<C: ConventionMarker> OptimizationStage<C> {
     }
 }
 
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
+use risingwave_common::id::ObjectId;
+use risingwave_pb::common::PbObjectType;
+use risingwave_sqlparser::ast::Statement;
+
 use crate::optimizer::plan_node::generic::GenericPlanRef;
+use crate::optimizer::plan_visitor::RelationCollectorVisitor;
+use crate::session::SessionImpl;
 
 pub struct LogicalOptimizer {}
 
@@ -222,6 +229,8 @@ static SIMPLE_UNNESTING: LazyLock<OptimizationStage> = LazyLock::new(|| {
             PullUpCorrelatedPredicateAggRule::create(),
             // Eliminate max one row
             MaxOneRowEliminateRule::create(),
+            // Eliminate lateral table-function apply into a unary ProjectSet.
+            ApplyTableFunctionToProjectSetRule::create(),
             // Convert apply to join.
             ApplyToJoinRule::create(),
         ],
@@ -419,6 +428,21 @@ static CONVERT_OVER_WINDOW: LazyLock<OptimizationStage> = LazyLock::new(|| {
     )
 });
 
+// DataFusion cannot apply `OverWindowToTopNRule`
+static CONVERT_OVER_WINDOW_FOR_BATCH: LazyLock<OptimizationStage> = LazyLock::new(|| {
+    OptimizationStage::new(
+        "Convert Over Window",
+        vec![
+            ProjectMergeRule::create(),
+            ProjectEliminateRule::create(),
+            TrivialProjectToValuesRule::create(),
+            UnionInputValuesMergeRule::create(),
+            OverWindowToAggAndJoinRule::create(),
+        ],
+        ApplyOrder::TopDown,
+    )
+});
+
 static MERGE_OVER_WINDOW: LazyLock<OptimizationStage> = LazyLock::new(|| {
     OptimizationStage::new(
         "Merge Over Window",
@@ -438,7 +462,19 @@ static REWRITE_LIKE_EXPR: LazyLock<OptimizationStage> = LazyLock::new(|| {
 static TOP_N_AGG_ON_INDEX: LazyLock<OptimizationStage> = LazyLock::new(|| {
     OptimizationStage::new(
         "TopN/SimpleAgg on Index",
-        vec![TopNOnIndexRule::create(), MinMaxOnIndexRule::create()],
+        vec![
+            TopNProjectTransposeRule::create(),
+            TopNOnIndexRule::create(),
+            MinMaxOnIndexRule::create(),
+        ],
+        ApplyOrder::TopDown,
+    )
+});
+
+static PROJECT_TOP_N_TRANSPOSE: LazyLock<OptimizationStage> = LazyLock::new(|| {
+    OptimizationStage::new(
+        "Project TopN Transpose",
+        vec![ProjectTopNTransposeRule::create()],
         ApplyOrder::TopDown,
     )
 });
@@ -510,9 +546,27 @@ static REWRITE_SOURCE_FOR_BATCH: LazyLock<OptimizationStage> = LazyLock::new(|| 
         "Rewrite Source For Batch",
         vec![
             SourceToKafkaScanRule::create(),
-            SourceToIcebergScanRule::create(),
+            // For Iceberg, we use the intermediate scan to defer metadata reading
+            // until after predicate pushdown and column pruning
+            SourceToIcebergIntermediateScanRule::create(),
         ],
         ApplyOrder::TopDown,
+    )
+});
+
+static MATERIALIZE_ICEBERG_SCAN: LazyLock<OptimizationStage> = LazyLock::new(|| {
+    OptimizationStage::new(
+        "Materialize Iceberg Scan",
+        vec![IcebergIntermediateScanRule::create()],
+        ApplyOrder::TopDown,
+    )
+});
+
+static ICEBERG_COUNT_STAR: LazyLock<OptimizationStage> = LazyLock::new(|| {
+    OptimizationStage::new(
+        "Iceberg Count Star Optimization",
+        vec![IcebergCountStarRule::create()],
+        ApplyOrder::BottomUp,
     )
 });
 
@@ -521,6 +575,32 @@ static TOP_N_TO_VECTOR_SEARCH: LazyLock<OptimizationStage> = LazyLock::new(|| {
         "TopN to Vector Search",
         vec![TopNToVectorSearchRule::create()],
         ApplyOrder::BottomUp,
+    )
+});
+
+static CORRELATED_TOP_N_TO_VECTOR_SEARCH_FOR_BATCH: LazyLock<OptimizationStage> =
+    LazyLock::new(|| {
+        OptimizationStage::new(
+            "Correlated TopN to Vector Search",
+            vec![CorrelatedTopNToVectorSearchRule::create(true)],
+            ApplyOrder::BottomUp,
+        )
+    });
+
+static CORRELATED_TOP_N_TO_VECTOR_SEARCH_FOR_STREAM: LazyLock<OptimizationStage> =
+    LazyLock::new(|| {
+        OptimizationStage::new(
+            "Correlated TopN to Vector Search",
+            vec![CorrelatedTopNToVectorSearchRule::create(false)],
+            ApplyOrder::BottomUp,
+        )
+    });
+
+static BATCH_MV_SELECTION: LazyLock<OptimizationStage> = LazyLock::new(|| {
+    OptimizationStage::new(
+        "Batch Mv Selection",
+        vec![MvSelectionRule::create()],
+        ApplyOrder::TopDown,
     )
 });
 
@@ -670,6 +750,8 @@ impl LogicalOptimizer {
         // In order to unnest a table function, we need to convert it into a `project_set` first.
         plan = plan.optimize_by_rules(&TABLE_FUNCTION_CONVERT)?;
 
+        plan = plan.optimize_by_rules(&CORRELATED_TOP_N_TO_VECTOR_SEARCH_FOR_STREAM)?;
+
         plan = Self::subquery_unnesting(plan, enable_share_plan, explain_trace, &ctx)?;
         if has_logical_max_one_row(plan.clone()) {
             // `MaxOneRow` is currently only used for the runtime check of
@@ -762,6 +844,13 @@ impl LogicalOptimizer {
             ctx.trace(plan.explain_to_string());
         }
 
+        if ctx.session_ctx().config().enable_mv_selection() {
+            let query_relations =
+                RelationCollectorVisitor::collect_with(HashSet::new(), plan.clone());
+            Self::register_batch_mview_candidates(ctx.session_ctx(), &ctx, &query_relations);
+            plan = plan.optimize_by_rules(&BATCH_MV_SELECTION)?;
+        }
+
         // Inline `NOW()` and `PROCTIME()`, only for batch queries.
         plan = Self::inline_now_proc_time(plan, &ctx);
 
@@ -784,7 +873,7 @@ impl LogicalOptimizer {
         // In order to unnest a table function, we need to convert it into a `project_set` first.
         plan = plan.optimize_by_rules(&TABLE_FUNCTION_CONVERT)?;
 
-        plan = plan.optimize_by_rules(&TOP_N_TO_VECTOR_SEARCH)?;
+        plan = plan.optimize_by_rules(&CORRELATED_TOP_N_TO_VECTOR_SEARCH_FOR_BATCH)?;
 
         plan = Self::subquery_unnesting(plan, false, explain_trace, &ctx)?;
 
@@ -824,7 +913,7 @@ impl LogicalOptimizer {
             last_total_rule_applied_before_predicate_pushdown = ctx.total_rule_applied();
             plan = Self::predicate_pushdown(plan, explain_trace, &ctx);
         }
-        plan = plan.optimize_by_rules(&CONVERT_OVER_WINDOW)?;
+        plan = plan.optimize_by_rules(&CONVERT_OVER_WINDOW_FOR_BATCH)?;
         plan = plan.optimize_by_rules(&MERGE_OVER_WINDOW)?;
 
         // Convert distinct aggregates.
@@ -834,6 +923,8 @@ impl LogicalOptimizer {
 
         plan = plan.optimize_by_rules(&JOIN_COMMUTE)?;
 
+        plan = plan.optimize_by_rules(&TOP_N_TO_VECTOR_SEARCH)?;
+
         // Do a final column pruning and predicate pushing down to clean up the plan.
         plan = Self::column_pruning(plan, explain_trace, &ctx);
         if last_total_rule_applied_before_predicate_pushdown != ctx.total_rule_applied() {
@@ -842,14 +933,24 @@ impl LogicalOptimizer {
             plan = Self::predicate_pushdown(plan, explain_trace, &ctx);
         }
 
+        // Materialize Iceberg intermediate scans after predicate pushdown and column pruning.
+        // This converts LogicalIcebergIntermediateScan to LogicalIcebergScan with anti-joins
+        // for delete files.
+        plan = plan.optimize_by_rules(&MATERIALIZE_ICEBERG_SCAN)?;
+
         plan = plan.optimize_by_rules(&CONSTANT_OUTPUT_REMOVE)?;
         plan = plan.optimize_by_rules(&PROJECT_REMOVE)?;
 
         plan = plan.optimize_by_rules(&COMMON_SUB_EXPR_EXTRACT)?;
 
+        // This need to be apply after PROJECT_REMOVE to ensure there is no projection between agg and iceberg scan.
+        plan = plan.optimize_by_rules(&ICEBERG_COUNT_STAR)?;
+
         plan = plan.optimize_by_rules(&PULL_UP_HOP)?;
 
         plan = plan.optimize_by_rules(&TOP_N_AGG_ON_INDEX)?;
+
+        plan = plan.optimize_by_rules(&PROJECT_TOP_N_TRANSPOSE)?;
 
         plan = plan.optimize_by_rules(&LIMIT_PUSH_DOWN)?;
 
@@ -861,5 +962,67 @@ impl LogicalOptimizer {
         ctx.may_store_explain_logical(&plan);
 
         Ok(plan)
+    }
+
+    fn register_batch_mview_candidates(
+        session: &SessionImpl,
+        context: &OptimizerContextRef,
+        query_relations: &HashSet<ObjectId>,
+    ) {
+        let catalog_reader = session.env().catalog_reader().read_guard();
+        let user_reader = session.env().user_info_reader().read_guard();
+        let Some(current_user) = user_reader.get_user_by_name(&session.user_name()) else {
+            return;
+        };
+        let mut mv_dependencies: HashMap<ObjectId, HashSet<ObjectId>> = HashMap::new();
+        let mut mviews_with_source_dependency: HashSet<ObjectId> = HashSet::new();
+        for dep in catalog_reader.iter_object_dependencies() {
+            mv_dependencies
+                .entry(dep.object_id)
+                .or_default()
+                .insert(dep.referenced_object_id);
+            if dep.referenced_object_type == PbObjectType::Source {
+                mviews_with_source_dependency.insert(dep.object_id);
+            }
+        }
+        let db_name = session.database();
+        let Ok(schemas) = catalog_reader.iter_schemas(&db_name) else {
+            return;
+        };
+
+        for schema in schemas {
+            for mv in schema.iter_created_mvs_with_acl(current_user) {
+                let mv_object_id = mv.id().as_object_id();
+                if mviews_with_source_dependency.contains(&mv_object_id) {
+                    continue;
+                }
+                let is_subset = mv_dependencies
+                    .get(&mv_object_id)
+                    .is_some_and(|deps| deps.is_subset(query_relations));
+                if !is_subset {
+                    continue;
+                }
+                let Ok(stmt) = mv.create_sql_ast() else {
+                    continue;
+                };
+                let Statement::CreateView {
+                    materialized: true,
+                    query,
+                    ..
+                } = stmt
+                else {
+                    continue;
+                };
+                let mut binder = Binder::new_for_batch(session);
+                let Ok(bound_query) = binder.bind_query(&query) else {
+                    continue;
+                };
+                let mut planner = Planner::new_for_batch_dql(context.clone());
+                let Ok(plan_root) = planner.plan_query(bound_query) else {
+                    continue;
+                };
+                context.add_batch_mview_candidate(mv.clone(), plan_root.plan.clone());
+            }
+        }
     }
 }

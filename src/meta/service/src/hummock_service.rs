@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,7 @@ use std::time::Duration;
 use compact_task::PbTaskStatus;
 use futures::StreamExt;
 use itertools::Itertools;
-use risingwave_common::catalog::{SYS_CATALOG_START_ID, TableId};
-use risingwave_hummock_sdk::HummockVersionId;
+use risingwave_common::catalog::SYS_CATALOG_START_ID;
 use risingwave_hummock_sdk::key_range::KeyRange;
 use risingwave_hummock_sdk::version::HummockVersionDelta;
 use risingwave_meta::backup_restore::BackupManagerRef;
@@ -86,10 +85,7 @@ impl HummockManagerService for HummockServiceImpl {
     ) -> Result<Response<UnpinVersionBeforeResponse>, Status> {
         let req = request.into_inner();
         self.hummock_manager
-            .unpin_version_before(
-                req.context_id,
-                HummockVersionId::new(req.unpin_version_before),
-            )
+            .unpin_version_before(req.context_id, req.unpin_version_before)
             .await?;
         Ok(Response::new(UnpinVersionBeforeResponse { status: None }))
     }
@@ -131,10 +127,7 @@ impl HummockManagerService for HummockServiceImpl {
     ) -> Result<Response<TriggerCompactionDeterministicResponse>, Status> {
         let req = request.into_inner();
         self.hummock_manager
-            .trigger_compaction_deterministic(
-                HummockVersionId::new(req.version_id),
-                req.compaction_groups,
-            )
+            .trigger_compaction_deterministic(req.version_id, req.compaction_groups)
             .await?;
         Ok(Response::new(TriggerCompactionDeterministicResponse {}))
     }
@@ -156,7 +149,7 @@ impl HummockManagerService for HummockServiceImpl {
         let req = request.into_inner();
         let version_deltas = self
             .hummock_manager
-            .list_version_deltas(HummockVersionId::new(req.start_id), req.num_limit)
+            .list_version_deltas(req.start_id, req.num_limit)
             .await?;
         let resp = ListVersionDeltasResponse {
             version_deltas: Some(PbHummockVersionDeltas {
@@ -179,8 +172,8 @@ impl HummockManagerService for HummockServiceImpl {
             .await?;
         Ok(Response::new(GetNewObjectIdsResponse {
             status: None,
-            start_id: object_id_range.start_id.inner(),
-            end_id: object_id_range.end_id.inner(),
+            start_id: object_id_range.start_id,
+            end_id: object_id_range.end_id,
         }))
     }
 
@@ -192,7 +185,7 @@ impl HummockManagerService for HummockServiceImpl {
         let compaction_group_id = request.compaction_group_id;
         let mut option = ManualCompactionOption {
             level: request.level as usize,
-            sst_ids: request.sst_ids.into_iter().map(|id| id.into()).collect(),
+            sst_ids: request.sst_ids,
             ..Default::default()
         };
 
@@ -212,13 +205,10 @@ impl HummockManagerService for HummockServiceImpl {
         }
 
         // get internal_table_id by metadata_manger
-        if request.table_id < SYS_CATALOG_START_ID as u32 {
+        if request.table_id.as_raw_id() < SYS_CATALOG_START_ID as u32 {
             // We need to make sure to use the correct table_id to filter sst
-            let table_id = TableId::new(request.table_id);
-            if let Ok(table_fragment) = self
-                .metadata_manager
-                .get_job_fragments_by_id(&table_id)
-                .await
+            let job_id = request.table_id;
+            if let Ok(table_fragment) = self.metadata_manager.get_job_fragments_by_id(job_id).await
             {
                 option.internal_table_id = HashSet::from_iter(table_fragment.all_table_ids());
             }
@@ -228,7 +218,7 @@ impl HummockManagerService for HummockServiceImpl {
             option
                 .internal_table_id
                 .iter()
-                .all(|table_id| *table_id < SYS_CATALOG_START_ID as u32),
+                .all(|table_id| table_id.as_raw_id() < SYS_CATALOG_START_ID as u32),
         );
 
         tracing::info!(
@@ -529,8 +519,8 @@ impl HummockManagerService for HummockServiceImpl {
             .flat_map(|(object_id, v)| {
                 v.into_iter()
                     .map(move |(compaction_group_id, sst_ids)| BranchedObject {
-                        object_id: object_id.inner(),
-                        sst_id: sst_ids.into_iter().map(|id| id.inner()).collect(),
+                        object_id,
+                        sst_id: sst_ids,
                         compaction_group_id,
                     })
             })

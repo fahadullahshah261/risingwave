@@ -1,16 +1,18 @@
-// Copyright 2025 RisingWave Labs
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Copyright 2023 RisingWave Labs
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package com.risingwave.connector.source.common;
 
@@ -76,8 +78,14 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
         var password = userProps.get(DbzConnectorConfig.PASSWORD);
         this.jdbcConnection = DriverManager.getConnection(jdbcUrl, user, password);
 
+        // Determine if this is AWS RDS (priority from high to low):
+        // 1. Explicit user configuration via 'postgres.is.aws.rds'
+        // 2. Automatic detection via hostname containing 'amazonaws.com'
+        // 3. Test-only parameter 'test.only.force.rds' (for backward compatibility)
         this.isAwsRds =
-                dbHost.contains(AWS_RDS_HOST)
+                Boolean.parseBoolean(
+                                userProps.getOrDefault(DbzConnectorConfig.PG_IS_AWS_RDS, "false"))
+                        || dbHost.contains(AWS_RDS_HOST)
                         || userProps
                                 .getOrDefault(DbzConnectorConfig.PG_TEST_ONLY_FORCE_RDS, "false")
                                 .equalsIgnoreCase("true");
@@ -104,7 +112,8 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
             // whenever a newer PG version is released, Debezium will take
             // some time to support it. So even though 18 is not released yet, we put a version
             // guard here.
-            if (pgVersion >= 18) {
+            LOG.info("Detected upstream Postgres major version: {}", pgVersion);
+            if (pgVersion > 18) {
                 throw ValidatorUtils.failedPrecondition(
                         "Postgres major version should be less than or equal to 17.");
             }
@@ -499,6 +508,28 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
             }
         }
 
+        // Query generated columns - they should be excluded from publication validation
+        // because PostgreSQL does not replicate generated columns in logical replication
+        List<String> generatedColumns = new ArrayList<>();
+        try (var stmt =
+                jdbcConnection.prepareStatement(
+                        ValidatorUtils.getSql("postgres.generated_columns"))) {
+            stmt.setString(1, schemaName);
+            stmt.setString(2, tableName);
+            var res = stmt.executeQuery();
+            while (res.next()) {
+                generatedColumns.add(res.getString("attname"));
+            }
+            if (!generatedColumns.isEmpty()) {
+                LOG.info(
+                        "Found generated columns in table '{}': {}",
+                        schemaName + "." + tableName,
+                        String.join(", ", generatedColumns));
+            }
+        } catch (SQLException e) {
+            // For PostgreSQL < 12 that doesn't support generated columns, ignore the error
+            LOG.debug("Failed to query generated columns (likely PG < 12): {}", e.getMessage());
+        }
         // PG 15 and up supports partial publication of table
         // check whether publication covers all columns of the table schema
         if (isPartialPublicationEnabled) {
@@ -514,22 +545,25 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
                     List<String> attNames = Arrays.asList(columnsPub);
                     for (int i = 0; i < tableSchema.getNumColumns(); i++) {
                         String columnName = tableSchema.getColumnNames()[i];
+                        // Skip generated columns - they are not included in publication
+                        if (generatedColumns.contains(columnName)) {
+                            LOG.info(
+                                    "Skipping generated column '{}' in publication validation",
+                                    columnName);
+                            continue;
+                        }
                         if (!attNames.contains(columnName)) {
                             throw ValidatorUtils.invalidArgument(
                                     String.format(
                                             "The publication '%s' does not cover all columns of the table '%s'",
                                             pubName, schemaName + "." + tableName));
                         }
-                        if (i == tableSchema.getNumColumns() - 1) {
-                            isPublicationCoversTable = true;
-                        }
                     }
-                    if (isPublicationCoversTable) {
-                        LOG.info(
-                                "The publication covers the table '{}'.",
-                                schemaName + "." + tableName);
-                        break;
-                    }
+                    // If we reach here, all non-generated columns are covered
+                    isPublicationCoversTable = true;
+                    LOG.info(
+                            "The publication covers the table '{}'.", schemaName + "." + tableName);
+                    break;
                 }
             }
         } else {
@@ -743,6 +777,9 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
             case "bytea":
                 // BYTEA -> BYTEA
                 return val == Data.DataType.TypeName.BYTEA_VALUE;
+            case "geometry":
+                // PostGIS GEOMETRY -> BYTEA (stored as EWKB bytes)
+                return val == Data.DataType.TypeName.BYTEA_VALUE;
             case "json":
             case "jsonb":
                 // JSON, JSONB -> JSONB
@@ -765,12 +802,15 @@ public class PostgresValidator extends DatabaseValidator implements AutoCloseabl
                 // ARRAY -> LIST
                 return val == Data.DataType.TypeName.LIST_VALUE;
             case "USER-DEFINED":
-                // Handle user-defined types like enum, citext, etc.
+                // Handle user-defined types like enum, citext, geometry, etc.
                 if (colInfo.udtName != null) {
                     switch (colInfo.udtName.toLowerCase()) {
                         case "citext":
                             // CITEXT -> CHARACTER VARYING
                             return val == Data.DataType.TypeName.VARCHAR_VALUE;
+                        case "geometry":
+                            // PostGIS GEOMETRY -> BYTEA (stored as EWKB bytes)
+                            return val == Data.DataType.TypeName.BYTEA_VALUE;
                         case "ltree":
                             return false;
                         case "hstore":

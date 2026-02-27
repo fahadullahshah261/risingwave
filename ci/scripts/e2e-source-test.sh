@@ -42,6 +42,10 @@ ACCEPT_EULA=Y DEBIAN_FRONTEND=noninteractive apt-get install -y mssql-tools unix
 export PATH="/opt/mssql-tools/bin/:$PATH"
 export SQLCMDSERVER=sqlserver-server SQLCMDUSER=SA SQLCMDPASSWORD="SomeTestOnly@SA" SQLCMDDBNAME=mydb SQLCMDPORT=1433
 
+# install mongosh
+wget --no-verbose https://repo.mongodb.org/apt/ubuntu/dists/noble/mongodb-org/8.0/multiverse/binary-amd64/mongodb-mongosh_2.5.8_amd64.deb
+dpkg -i mongodb-mongosh_2.5.8_amd64.deb
+
 echo "--- Setup HashiCorp Vault for testing"
 # Set vault environment variables, used in `ci/scripts/setup-vault.sh`
 export VAULT_ADDR="http://vault-server:8200"
@@ -58,12 +62,18 @@ if [ "$profile" == "ci-dev" ]; then
     risedev slt './e2e_test/debug_mode_only/debug_splits.slt'
 fi
 
+echo "--- Run mqtt test"
+risedev slt './e2e_test/mqtt/**/*.slt'
+echo "--- Run mqtt test done"
+
 echo "--- Run kafka sasl test"
 risedev slt './e2e_test/kafka-sasl/**/*.slt' -j4
 echo "--- Run kafka sasl test done"
 
-risedev slt './e2e_test/source_inline/**/*.slt' -j4
-risedev slt './e2e_test/source_inline/**/*.slt.serial'
+# Skip cron_only tests in both PR and main-cron e2e-source-test
+# cron_only tests are run separately in main-cron via dedicated job
+risedev slt './e2e_test/source_inline/**/*.slt' --skip 'cron_only' -j8
+risedev slt './e2e_test/source_inline/**/*.slt.serial' --skip 'cron_only'
 
 echo "--- Run Vault secret tests"
 risedev slt './e2e_test/ddl/vault_secret.slt'
@@ -107,22 +117,32 @@ risedev ci-start ci-1cn-1fe-with-recovery
 
 
 echo "--- mongodb cdc test"
-# install the mongo shell
-wget --no-verbose http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
-wget --no-verbose https://repo.mongodb.org/apt/ubuntu/dists/focal/mongodb-org/4.4/multiverse/binary-amd64/mongodb-org-shell_4.4.28_amd64.deb
-dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb
-dpkg -i mongodb-org-shell_4.4.28_amd64.deb
 
 echo '> ping mongodb'
-echo 'db.runCommand({ping: 1})' | mongo mongodb://mongodb:27017
+echo 'db.runCommand({ping: 1})' | mongosh mongodb://mongodb:27017
 echo '> rs config'
-echo 'rs.conf()' | mongo mongodb://mongodb:27017
+echo 'rs.conf()' | mongosh mongodb://mongodb:27017
 echo '> run test..'
-risedev slt './e2e_test/source_legacy/cdc/mongodb/**/*.slt'
+# This is actually redundant. `source_inline` is already executed above.
+risedev slt './e2e_test/source_inline/cdc/mongodb/**/*.slt'
 
 echo "--- inline cdc test"
 export MYSQL_HOST=mysql MYSQL_TCP_PORT=3306 MYSQL_PWD=123456
+
+echo "--- Starting MySQL CDC offline schema change test for OpendalSchemaHistory ---"
+source ci/scripts/e2e-source-mysql-offline-schema-change.sh
+
+echo "--- Starting MySQL CDC binlog expire and ALTER SOURCE RESET test ---"
+source ci/scripts/e2e-source-mysql-cdc-reset.sh
+
+echo "--- mysql offline schema change test done --- \n\n"
+
+echo "--- re-starting risingwave cluster"
+RUST_LOG="debug,risingwave_stream=info,risingwave_batch=info,risingwave_storage=info" \
+risedev ci-start ci-1cn-1fe-with-recovery
+
 risedev slt './e2e_test/source_legacy/cdc_inline/**/*.slt'
+
 
 echo "--- mysql & postgres cdc validate test"
 risedev slt './e2e_test/source_legacy/cdc/cdc.validate.mysql.slt'

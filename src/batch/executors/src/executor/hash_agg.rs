@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2024 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -329,7 +329,7 @@ impl AggSpillManager {
         spill_metrics: Arc<BatchSpillMetrics>,
     ) -> Result<Self> {
         let suffix_uuid = uuid::Uuid::new_v4();
-        let dir = format!("/{}-{}/", agg_identity, suffix_uuid);
+        let dir = format!("{}-{}/", agg_identity, suffix_uuid);
         let op = SpillOp::create(dir, spill_backend)?;
         let agg_state_writers = Vec::with_capacity(partition_num);
         let agg_state_chunk_builder = Vec::with_capacity(partition_num);

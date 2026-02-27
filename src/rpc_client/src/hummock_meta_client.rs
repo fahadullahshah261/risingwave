@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,16 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use risingwave_hummock_sdk::version::HummockVersion;
-use risingwave_hummock_sdk::{HummockEpoch, HummockVersionId, ObjectIdRange, SyncResult};
+use risingwave_hummock_sdk::{
+    CompactionGroupId, HummockEpoch, HummockVersionId, ObjectIdRange, SyncResult,
+};
 use risingwave_pb::hummock::{
     PbHummockVersion, SubscribeCompactionEventRequest, SubscribeCompactionEventResponse,
 };
 use risingwave_pb::iceberg_compaction::{
     SubscribeIcebergCompactionEventRequest, SubscribeIcebergCompactionEventResponse,
 };
+use risingwave_pb::id::{HummockSstableId, JobId, TableId};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub type CompactionEventItem = std::result::Result<SubscribeCompactionEventResponse, tonic::Status>;
@@ -50,10 +53,10 @@ pub trait HummockMetaClient: Send + Sync + 'static {
     }
     async fn trigger_manual_compaction(
         &self,
-        compaction_group_id: u64,
-        table_id: u32,
+        compaction_group_id: CompactionGroupId,
+        table_id: JobId,
         level: u32,
-        sst_ids: Vec<u64>,
+        sst_ids: Vec<HummockSstableId>,
     ) -> Result<()>;
     async fn trigger_full_gc(
         &self,
@@ -71,7 +74,7 @@ pub trait HummockMetaClient: Send + Sync + 'static {
     async fn get_version_by_epoch(
         &self,
         epoch: HummockEpoch,
-        table_id: u32,
+        table_id: TableId,
     ) -> Result<PbHummockVersion>;
 
     async fn subscribe_iceberg_compaction_event(

@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,12 +27,16 @@ use risingwave_common::metrics::TrAdderGauge;
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
 use tokio::task::JoinHandle;
 
+#[cfg(feature = "datafusion")]
+use crate::datafusion::DataFusionMetrics;
 use crate::session::SessionMapRef;
 
 #[derive(Clone)]
 pub struct FrontendMetrics {
     pub query_counter_local_execution: GenericCounter<AtomicU64>,
     pub latency_local_execution: Histogram,
+    #[cfg(feature = "datafusion")]
+    pub datafusion: DataFusionMetrics,
     pub active_sessions: IntGauge,
     pub batch_total_mem: TrAdderGauge,
 }
@@ -44,17 +48,20 @@ impl FrontendMetrics {
     fn new(registry: &Registry) -> Self {
         let query_counter_local_execution = register_int_counter_with_registry!(
             "frontend_query_counter_local_execution",
-            "Total query number of local execution mode",
+            "Total query number of local execution mode for RisingWave batch engine",
             registry
         )
         .unwrap();
 
         let opts = histogram_opts!(
             "frontend_latency_local_execution",
-            "latency of local execution mode",
+            "latency of local execution mode for RisingWave batch engine",
             exponential_buckets(0.01, 2.0, 23).unwrap()
         );
         let latency_local_execution = register_histogram_with_registry!(opts, registry).unwrap();
+
+        #[cfg(feature = "datafusion")]
+        let datafusion = DataFusionMetrics::new(registry);
 
         let active_sessions = register_int_gauge_with_registry!(
             "frontend_active_sessions",
@@ -76,6 +83,8 @@ impl FrontendMetrics {
         Self {
             query_counter_local_execution,
             latency_local_execution,
+            #[cfg(feature = "datafusion")]
+            datafusion,
             active_sessions,
             batch_total_mem,
         }
@@ -96,8 +105,8 @@ pub struct CursorMetrics {
     pub subscription_cursor_query_duration: HistogramVec,
     pub subscription_cursor_declare_duration: HistogramVec,
     pub subscription_cursor_fetch_duration: HistogramVec,
-    subsription_cursor_nums: IntGauge,
-    invalid_subsription_cursor_nums: IntGauge,
+    subscription_cursor_nums: IntGauge,
+    invalid_subscription_cursor_nums: IntGauge,
     subscription_cursor_last_fetch_duration: HistogramVec,
     _cursor_metrics_collector: Option<Arc<CursorMetricsCollector>>,
 }
@@ -134,14 +143,14 @@ impl CursorMetrics {
         let subscription_cursor_fetch_duration =
             register_histogram_vec_with_registry!(opts, &["subscription_name"], registry).unwrap();
 
-        let subsription_cursor_nums = register_int_gauge_with_registry!(
-            "subsription_cursor_nums",
+        let subscription_cursor_nums = register_int_gauge_with_registry!(
+            "subscription_cursor_nums",
             "The number of subscription cursor",
             registry
         )
         .unwrap();
-        let invalid_subsription_cursor_nums = register_int_gauge_with_registry!(
-            "invalid_subsription_cursor_nums",
+        let invalid_subscription_cursor_nums = register_int_gauge_with_registry!(
+            "invalid_subscription_cursor_nums",
             "The number of invalid subscription cursor",
             registry
         )
@@ -160,8 +169,8 @@ impl CursorMetrics {
             subscription_cursor_query_duration,
             subscription_cursor_declare_duration,
             subscription_cursor_fetch_duration,
-            subsription_cursor_nums,
-            invalid_subsription_cursor_nums,
+            subscription_cursor_nums,
+            invalid_subscription_cursor_nums,
             subscription_cursor_last_fetch_duration,
         }
     }
@@ -173,8 +182,8 @@ impl CursorMetrics {
     pub fn start_with_session_map(&mut self, session_map: SessionMapRef) {
         self._cursor_metrics_collector = Some(Arc::new(CursorMetricsCollector::new(
             session_map,
-            self.subsription_cursor_nums.clone(),
-            self.invalid_subsription_cursor_nums.clone(),
+            self.subscription_cursor_nums.clone(),
+            self.invalid_subscription_cursor_nums.clone(),
             self.subscription_cursor_last_fetch_duration.clone(),
         )));
     }
@@ -187,8 +196,8 @@ impl CursorMetrics {
 }
 
 pub struct PeriodicCursorMetrics {
-    pub subsription_cursor_nums: i64,
-    pub invalid_subsription_cursor_nums: i64,
+    pub subscription_cursor_nums: i64,
+    pub invalid_subscription_cursor_nums: i64,
     pub subscription_cursor_last_fetch_duration: HashMap<String, f64>,
 }
 
@@ -199,8 +208,8 @@ struct CursorMetricsCollector {
 impl CursorMetricsCollector {
     fn new(
         session_map: SessionMapRef,
-        subsription_cursor_nums: IntGauge,
-        invalid_subsription_cursor_nums: IntGauge,
+        subscription_cursor_nums: IntGauge,
+        invalid_subscription_cursor_nums: IntGauge,
         subscription_cursor_last_fetch_duration: HistogramVec,
     ) -> Self {
         const COLLECT_INTERVAL_SECONDS: u64 = 60;
@@ -222,17 +231,17 @@ impl CursorMetricsCollector {
                 }
 
                 let session_vec = { session_map.read().values().cloned().collect::<Vec<_>>() };
-                let mut subsription_cursor_nums_value = 0;
-                let mut invalid_subsription_cursor_nums_value = 0;
+                let mut subscription_cursor_nums_value = 0;
+                let mut invalid_subscription_cursor_nums_value = 0;
                 for session in &session_vec {
                     let periodic_cursor_metrics = session
                         .get_cursor_manager()
                         .get_periodic_cursor_metrics()
                         .await;
-                    subsription_cursor_nums_value +=
-                        periodic_cursor_metrics.subsription_cursor_nums;
-                    invalid_subsription_cursor_nums_value +=
-                        periodic_cursor_metrics.invalid_subsription_cursor_nums;
+                    subscription_cursor_nums_value +=
+                        periodic_cursor_metrics.subscription_cursor_nums;
+                    invalid_subscription_cursor_nums_value +=
+                        periodic_cursor_metrics.invalid_subscription_cursor_nums;
                     for (subscription_name, duration) in
                         &periodic_cursor_metrics.subscription_cursor_last_fetch_duration
                     {
@@ -241,8 +250,8 @@ impl CursorMetricsCollector {
                             .observe(*duration);
                     }
                 }
-                subsription_cursor_nums.set(subsription_cursor_nums_value);
-                invalid_subsription_cursor_nums.set(invalid_subsription_cursor_nums_value);
+                subscription_cursor_nums.set(subscription_cursor_nums_value);
+                invalid_subscription_cursor_nums.set(invalid_subscription_cursor_nums_value);
             }
         });
         Self {

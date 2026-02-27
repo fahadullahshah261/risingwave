@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -485,6 +485,7 @@ mod tests {
         let (res_tx, mut res_rx) = unbounded_channel();
         let get_table_id = 12;
         let iter_table_id = 14654;
+
         let read_options = TracedReadOptions::for_test(get_table_id);
         let iter_read_options = TracedReadOptions::for_test(iter_table_id);
         let op = Operation::get(Bytes::from(vec![123]), Some(123), read_options);

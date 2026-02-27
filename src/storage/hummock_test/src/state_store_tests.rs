@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ use itertools::Itertools;
 use risingwave_common::bitmap::Bitmap;
 use risingwave_common::catalog::{TableId, TableOption};
 use risingwave_common::hash::VirtualNode;
+use risingwave_common::id::FragmentId;
 use risingwave_common::util::epoch::{EpochExt, INVALID_EPOCH, MAX_EPOCH, test_epoch};
 use risingwave_hummock_sdk::key::{FullKey, TableKeyRange, prefixed_range_with_vnode};
 use risingwave_hummock_sdk::{HummockReadEpoch, LocalSstableInfo, SyncResult};
@@ -55,7 +56,7 @@ async fn test_empty_read() {
                 gen_key_from_str(VirtualNode::ZERO, "test_key"),
                 u64::MAX,
                 ReadOptions {
-                    table_id: TableId { table_id: 2333 },
+                    table_id: 2333.into(),
                     cache_policy: CachePolicy::Fill(Hint::Normal),
                     ..Default::default()
                 },
@@ -72,7 +73,7 @@ async fn test_empty_read() {
             ),
             u64::MAX,
             ReadOptions {
-                table_id: TableId { table_id: 2333 },
+                table_id: TableId::new(2333),
                 cache_policy: CachePolicy::Fill(Hint::Normal),
                 ..Default::default()
             },
@@ -1253,7 +1254,7 @@ async fn test_clear_shared_buffer() {
 #[tokio::test]
 async fn test_replicated_local_hummock_storage() {
     use risingwave_storage::store::ReadOptions;
-    const TEST_TABLE_ID: TableId = TableId { table_id: 233 };
+    const TEST_TABLE_ID: TableId = TableId::new(233);
 
     let (hummock_storage, meta_client) = with_hummock_storage(TEST_TABLE_ID).await;
 
@@ -1280,9 +1281,7 @@ async fn test_replicated_local_hummock_storage() {
         .unwrap();
 
     let test_read_options = StateStoreTestReadOptions {
-        table_id: TableId {
-            table_id: TEST_TABLE_ID.table_id,
-        },
+        table_id: TEST_TABLE_ID,
         cache_policy: CachePolicy::Fill(Hint::Normal),
         ..Default::default()
     };
@@ -1291,6 +1290,7 @@ async fn test_replicated_local_hummock_storage() {
     let mut local_hummock_storage = hummock_storage
         .new_local(NewLocalOptions::new_replicated(
             TEST_TABLE_ID,
+            FragmentId::default(),
             OpConsistencyLevel::Inconsistent,
             TableOption {
                 retention_seconds: None,
@@ -1456,6 +1456,7 @@ async fn test_iter_log() {
     let mut in_memory_local = in_memory_state_store
         .new_local(NewLocalOptions {
             table_id,
+            fragment_id: FragmentId::default(),
             op_consistency_level: OpConsistencyLevel::ConsistentOldValue {
                 check_old_value: CHECK_BYTES_EQUAL.clone(),
                 is_log_store: true,
@@ -1472,6 +1473,7 @@ async fn test_iter_log() {
     let mut hummock_local = hummock_storage
         .new_local(NewLocalOptions {
             table_id,
+            fragment_id: FragmentId::default(),
             op_consistency_level: OpConsistencyLevel::ConsistentOldValue {
                 check_old_value: CHECK_BYTES_EQUAL.clone(),
                 is_log_store: true,
@@ -1598,6 +1600,7 @@ async fn test_read_log_next_epoch() {
     let mut hummock_local = hummock_storage
         .new_local(NewLocalOptions {
             table_id,
+            fragment_id: FragmentId::default(),
             op_consistency_level: OpConsistencyLevel::ConsistentOldValue {
                 check_old_value: CHECK_BYTES_EQUAL.clone(),
                 is_log_store: true,

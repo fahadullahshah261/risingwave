@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,8 +34,8 @@ use risingwave_pb::meta::{FragmentWorkerSlotMapping, MetaSnapshot, SubscribeResp
 use risingwave_rpc_client::ComputeClientPoolRef;
 use tokio::sync::watch::Sender;
 
+use crate::catalog::FragmentId;
 use crate::catalog::root_catalog::Catalog;
-use crate::catalog::{FragmentId, SecretId};
 use crate::scheduler::HummockSnapshotManagerRef;
 use crate::user::user_manager::UserInfoManager;
 
@@ -114,8 +114,8 @@ impl ObserverState for FrontendObserverNode {
             Info::Recovery(_) => {
                 self.compute_client_pool.invalidate_all();
             }
-            Info::ComputeNodeTotalCpuCount(count) => {
-                LicenseManager::get().update_cpu_core_count(count as _);
+            Info::ClusterResource(resource) => {
+                LicenseManager::get().update_cluster_resource(resource);
             }
         }
     }
@@ -150,7 +150,8 @@ impl ObserverState for FrontendObserverNode {
             session_params,
             version,
             secrets,
-            compute_node_total_cpu_count,
+            cluster_resource,
+            object_dependencies,
         } = snapshot;
 
         for db in databases {
@@ -186,6 +187,7 @@ impl ObserverState for FrontendObserverNode {
         for secret in &secrets {
             catalog_guard.create_secret(secret)
         }
+        catalog_guard.set_object_dependencies(object_dependencies);
         for user in users {
             user_guard.create_user(user)
         }
@@ -208,7 +210,7 @@ impl ObserverState for FrontendObserverNode {
         *self.session_params.write() =
             serde_json::from_str(&session_params.unwrap().params).unwrap();
         LocalSecretManager::global().init_secrets(secrets);
-        LicenseManager::get().update_cpu_core_count(compute_node_total_cpu_count as _);
+        LicenseManager::get().update_cluster_resource(cluster_resource.unwrap());
     }
 }
 
@@ -262,6 +264,9 @@ impl FrontendObserverNode {
                 _ => panic!("receive an unsupported notify {:?}", resp),
             },
             Info::ObjectGroup(object_group) => {
+                if !object_group.dependencies.is_empty() {
+                    catalog_guard.insert_object_dependencies(object_group.dependencies.clone());
+                }
                 for object in &object_group.objects {
                     let Some(obj) = object.object_info.as_ref() else {
                         continue;
@@ -286,11 +291,11 @@ impl FrontendObserverNode {
                             Operation::Delete => catalog_guard.drop_table(
                                 table.database_id,
                                 table.schema_id,
-                                table.id.into(),
+                                table.id,
                             ),
                             Operation::Update => {
                                 let old_fragment_id = catalog_guard
-                                    .get_any_table_by_id(&table.id.into())
+                                    .get_any_table_by_id(table.id)
                                     .unwrap()
                                     .fragment_id;
                                 catalog_guard.update_table(table);
@@ -336,7 +341,7 @@ impl FrontendObserverNode {
                             Operation::Delete => catalog_guard.drop_index(
                                 index.database_id,
                                 index.schema_id,
-                                index.id.into(),
+                                index.id,
                             ),
                             Operation::Update => catalog_guard.update_index(index),
                             _ => panic!("receive an unsupported notify {:?}", resp),
@@ -354,7 +359,7 @@ impl FrontendObserverNode {
                             Operation::Delete => catalog_guard.drop_function(
                                 function.database_id,
                                 function.schema_id,
-                                function.id.into(),
+                                function.id,
                             ),
                             Operation::Update => catalog_guard.update_function(function),
                             _ => panic!("receive an unsupported notify {:?}", resp),
@@ -379,7 +384,7 @@ impl FrontendObserverNode {
                                 Operation::Delete => catalog_guard.drop_secret(
                                     secret.database_id,
                                     secret.schema_id,
-                                    SecretId::new(secret.id),
+                                    secret.id,
                                 ),
                                 Operation::Update => catalog_guard.update_secret(&secret),
                                 _ => panic!("receive an unsupported notify {:?}", resp),
@@ -393,7 +398,7 @@ impl FrontendObserverNode {
                 Operation::Delete => catalog_guard.drop_function(
                     function.database_id,
                     function.schema_id,
-                    function.id.into(),
+                    function.id,
                 ),
                 Operation::Update => catalog_guard.update_function(function),
                 _ => panic!("receive an unsupported notify {:?}", resp),
@@ -414,11 +419,9 @@ impl FrontendObserverNode {
                 secret.value = "SECRET VALUE SHOULD NOT BE REVEALED".as_bytes().to_vec();
                 match resp.operation() {
                     Operation::Add => catalog_guard.create_secret(&secret),
-                    Operation::Delete => catalog_guard.drop_secret(
-                        secret.database_id,
-                        secret.schema_id,
-                        SecretId::new(secret.id),
-                    ),
+                    Operation::Delete => {
+                        catalog_guard.drop_secret(secret.database_id, secret.schema_id, secret.id)
+                    }
                     Operation::Update => catalog_guard.update_secret(&secret),
                     _ => panic!("receive an unsupported notify {:?}", resp),
                 }
@@ -504,7 +507,11 @@ impl FrontendObserverNode {
                     .upsert_serving_fragment_mapping(convert_worker_slot_mapping(&mappings));
             }
             Operation::Delete => self.worker_node_manager.remove_serving_fragment_mapping(
-                &mappings.into_iter().map(|m| m.fragment_id).collect_vec(),
+                mappings
+                    .into_iter()
+                    .map(|m| m.fragment_id)
+                    .collect_vec()
+                    .as_slice(),
             ),
             Operation::Snapshot => {
                 self.worker_node_manager
@@ -535,7 +542,7 @@ impl FrontendObserverNode {
                 LocalSecretManager::global().update_secret(secret.id, secret.value);
             }
             _ => {
-                panic!("error type notification");
+                panic!("invalid notification operation: {resp_op:?}");
             }
         }
     }

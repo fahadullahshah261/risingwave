@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@
 #![feature(proc_macro_hygiene, stmt_expr_attributes)]
 #![feature(trait_alias)]
 #![feature(if_let_guard)]
-#![feature(let_chains)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(macro_metavar_expr)]
@@ -71,6 +70,10 @@ pub(crate) mod error;
 mod meta_client;
 pub mod metrics_reader;
 pub use metrics_reader::MetricsReaderImpl;
+
+#[cfg(feature = "datafusion")]
+pub mod datafusion;
+
 pub mod test_utils;
 mod user;
 pub mod webhook;

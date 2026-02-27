@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2024 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ use risingwave_common::secret::LocalSecretManager;
 use risingwave_connector_codec::decoder::avro::MapHandling;
 use risingwave_pb::catalog::{PbSchemaRegistryNameStrategy, StreamSourceInfo};
 
+use super::unified::json::BigintUnsignedHandlingMode;
 use super::utils::get_kafka_topic;
 use super::{DebeziumProps, TimeHandling, TimestampHandling, TimestamptzHandling};
 use crate::WithOptionsSecResolved;
@@ -30,11 +31,30 @@ use crate::schema::schema_registry::SchemaRegistryConfig;
 use crate::source::cdc::CDC_MONGODB_STRONG_SCHEMA_KEY;
 use crate::source::{SourceColumnDesc, SourceEncode, SourceFormat, extract_source_struct};
 
+pub const PARQUET_CASE_INSENSITIVE_KEY: &str = "parquet.case_insensitive";
+
 /// Note: this is created in `SourceReader::build_stream`
 #[derive(Debug, Clone, Default)]
 pub struct ParserConfig {
     pub common: CommonParserConfig,
     pub specific: SpecificParserConfig,
+}
+
+fn parse_parquet_case_insensitive_option(
+    options_with_secret: &BTreeMap<String, String>,
+) -> ConnectorResult<bool> {
+    let value = options_with_secret.get(PARQUET_CASE_INSENSITIVE_KEY);
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let parsed = match value.trim().to_ascii_lowercase().parse::<bool>() {
+        Ok(parsed) => parsed,
+        Err(_) => bail!(
+            "invalid value for {}, expect true or false",
+            PARQUET_CASE_INSENSITIVE_KEY
+        ),
+    };
+    Ok(parsed)
 }
 
 impl ParserConfig {
@@ -63,7 +83,7 @@ pub enum EncodingProperties {
     Json(JsonProperties),
     MongoJson(MongoProperties),
     Bytes(BytesProperties),
-    Parquet,
+    Parquet(ParquetProperties),
     Native,
     /// Encoding can't be specified because the source will determines it. Now only used in Iceberg.
     None,
@@ -94,6 +114,7 @@ impl SpecificParserConfig {
             timestamp_handling: None,
             timestamptz_handling: None,
             time_handling: None,
+            bigint_unsigned_handling: None,
             handle_toast_columns: false,
         }),
         protocol_config: ProtocolProperties::Plain,
@@ -139,7 +160,10 @@ impl SpecificParserConfig {
                 delimiter: info.csv_delimiter as u8,
                 has_header: info.csv_has_header,
             }),
-            (SourceFormat::Plain, SourceEncode::Parquet) => EncodingProperties::Parquet,
+            (SourceFormat::Plain, SourceEncode::Parquet) => {
+                let case_insensitive = parse_parquet_case_insensitive_option(&options_with_secret)?;
+                EncodingProperties::Parquet(ParquetProperties { case_insensitive })
+            }
             (SourceFormat::Plain, SourceEncode::Avro)
             | (SourceFormat::Upsert, SourceEncode::Avro) => {
                 let mut config = AvroProperties {
@@ -182,11 +206,10 @@ impl SpecificParserConfig {
                     }
                 } else {
                     SchemaLocation::File {
-                        url: info.row_schema_location.clone(),
+                        url: info.row_schema_location,
                         aws_auth_props: Some(
                             serde_json::from_value::<AwsAuthProps>(
-                                serde_json::to_value(format_encode_options_with_secret.clone())
-                                    .unwrap(),
+                                serde_json::to_value(format_encode_options_with_secret).unwrap(),
                             )
                             .map_err(|e| anyhow::anyhow!(e))?,
                         ),
@@ -226,11 +249,10 @@ impl SpecificParserConfig {
                     }
                 } else {
                     SchemaLocation::File {
-                        url: info.row_schema_location.clone(),
+                        url: info.row_schema_location,
                         aws_auth_props: Some(
                             serde_json::from_value::<AwsAuthProps>(
-                                serde_json::to_value(format_encode_options_with_secret.clone())
-                                    .unwrap(),
+                                serde_json::to_value(format_encode_options_with_secret).unwrap(),
                             )
                             .map_err(|e| anyhow::anyhow!(e))?,
                         ),
@@ -272,6 +294,7 @@ impl SpecificParserConfig {
                     &format_encode_options_with_secret,
                 )?,
                 time_handling: None,
+                bigint_unsigned_handling: None,
                 handle_toast_columns: false,
             }),
             (SourceFormat::DebeziumMongo, SourceEncode::Json) => {
@@ -351,12 +374,18 @@ pub struct CsvProperties {
     pub has_header: bool,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ParquetProperties {
+    pub case_insensitive: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct JsonProperties {
     pub use_schema_registry: bool,
     pub timestamp_handling: Option<TimestampHandling>,
     pub timestamptz_handling: Option<TimestamptzHandling>,
     pub time_handling: Option<TimeHandling>,
+    pub bigint_unsigned_handling: Option<BigintUnsignedHandlingMode>,
     pub handle_toast_columns: bool,
 }
 

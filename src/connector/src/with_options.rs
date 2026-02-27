@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::time::Duration;
 
+use risingwave_pb::id::SecretId;
 use risingwave_pb::secret::PbSecretRef;
 
 use crate::error::ConnectorResult;
@@ -24,8 +25,9 @@ use crate::source::cdc::MYSQL_CDC_CONNECTOR;
 use crate::source::cdc::external::ExternalCdcTableType;
 use crate::source::iceberg::ICEBERG_CONNECTOR;
 use crate::source::{
-    AZBLOB_CONNECTOR, BATCH_POSIX_FS_CONNECTOR, GCS_CONNECTOR, KAFKA_CONNECTOR,
-    LEGACY_S3_CONNECTOR, OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, UPSTREAM_SOURCE_KEY,
+    ADBC_SNOWFLAKE_CONNECTOR, AZBLOB_CONNECTOR, BATCH_POSIX_FS_CONNECTOR, GCS_CONNECTOR,
+    KAFKA_CONNECTOR, LEGACY_S3_CONNECTOR, OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR,
+    PULSAR_CONNECTOR, UPSTREAM_SOURCE_KEY,
 };
 
 /// Marker trait for `WITH` options. Only for `#[derive(WithOptions)]`, should not be used manually.
@@ -126,6 +128,14 @@ pub trait WithPropertiesExt: Get + GetKeyIter + Sized {
     }
 
     #[inline(always)]
+    fn is_pulsar_connector(&self) -> bool {
+        let Some(connector) = self.get_connector() else {
+            return false;
+        };
+        connector == PULSAR_CONNECTOR
+    }
+
+    #[inline(always)]
     fn is_mysql_cdc_connector(&self) -> bool {
         let Some(connector) = self.get_connector() else {
             return false;
@@ -202,10 +212,12 @@ pub trait WithPropertiesExt: Get + GetKeyIter + Sized {
             .unwrap_or(false)
     }
 
-    /// See [`crate::source::batch::BatchSourceSplit`] for more details.
     fn is_batch_connector(&self) -> bool {
         self.get(UPSTREAM_SOURCE_KEY)
-            .map(|s| s.eq_ignore_ascii_case(BATCH_POSIX_FS_CONNECTOR))
+            .map(|s| {
+                s.eq_ignore_ascii_case(BATCH_POSIX_FS_CONNECTOR)
+                    || s.eq_ignore_ascii_case(ADBC_SNOWFLAKE_CONNECTOR)
+            })
             .unwrap_or(false)
     }
 
@@ -255,12 +267,9 @@ impl WithOptionsSecResolved {
         &mut self,
         update_alter_props: BTreeMap<String, String>,
         update_alter_secret_refs: BTreeMap<String, PbSecretRef>,
-    ) -> ConnectorResult<(Vec<u32>, Vec<u32>)> {
-        let to_add_secret_dep = update_alter_secret_refs
-            .values()
-            .map(|new_rely_secret| new_rely_secret.secret_id)
-            .collect();
-        let mut to_remove_secret_dep: Vec<u32> = vec![];
+    ) -> ConnectorResult<(Vec<SecretId>, Vec<SecretId>)> {
+        let mut to_add_secret_dep: Vec<SecretId> = vec![];
+        let mut to_remove_secret_dep: Vec<SecretId> = vec![];
 
         // make sure the key in update_alter_props and update_alter_secret_refs not collide
         for key in update_alter_props.keys() {
@@ -272,22 +281,28 @@ impl WithOptionsSecResolved {
         }
 
         // remove legacy key if it's set in both plaintext and secret
+        // When a property changes from secret to plaintext, remove the old secret dependency
         for k in update_alter_props.keys() {
             if let Some(removed_secret) = self.secret_ref.remove(k) {
                 to_remove_secret_dep.push(removed_secret.secret_id);
             }
         }
+
+        // Handle secret ref updates
         for (k, v) in &update_alter_secret_refs {
+            // Remove any plaintext value for this key
             self.inner.remove(k);
 
             if let Some(old_secret_ref) = self.secret_ref.get(k) {
-                // no need to remove, do extend later
                 if old_secret_ref.secret_id != v.secret_id {
+                    // Secret is being changed to a different secret
                     to_remove_secret_dep.push(old_secret_ref.secret_id);
-                } else {
-                    // If the secret ref is the same, we don't need to update it.
-                    continue;
+                    to_add_secret_dep.push(v.secret_id);
                 }
+                // If the secret ref is the same, we don't need to update dependencies
+            } else {
+                // New secret dependency being added
+                to_add_secret_dep.push(v.secret_id);
             }
         }
 

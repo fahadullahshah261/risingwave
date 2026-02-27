@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,6 +42,7 @@ use crate::scheduler::{DistributedQueryStream, LocalQueryStream};
 use crate::session::SessionImpl;
 use crate::utils::WithOptions;
 
+mod alter_connection_props;
 mod alter_database_param;
 mod alter_mv;
 mod alter_owner;
@@ -54,6 +55,7 @@ mod alter_sink_props;
 mod alter_source_column;
 mod alter_source_props;
 mod alter_source_with_sr;
+mod alter_streaming_config;
 mod alter_streaming_enable_unaligned_join;
 mod alter_streaming_rate_limit;
 mod alter_swap_rename;
@@ -63,6 +65,7 @@ pub mod alter_table_drop_connector;
 pub mod alter_table_props;
 mod alter_table_with_sr;
 pub mod alter_user;
+mod alter_utils;
 pub mod cancel_job;
 pub mod close_cursor;
 mod comment;
@@ -110,6 +113,7 @@ pub mod privilege;
 pub mod query;
 mod recover;
 mod refresh;
+mod reset_source;
 pub mod show;
 mod transaction;
 mod use_db;
@@ -488,7 +492,7 @@ pub async fn handle(
             DescribeKind::Plain => describe::handle_describe(handler_args, name),
         },
         Statement::DescribeFragment { fragment_id } => {
-            describe::handle_describe_fragment(handler_args, fragment_id).await
+            describe::handle_describe_fragment(handler_args, fragment_id.into()).await
         }
         Statement::Discard(..) => discard::handle_discard(handler_args),
         Statement::ShowObjects {
@@ -517,8 +521,9 @@ pub async fn handle(
                     | ObjectType::Index
                     | ObjectType::Table
                     | ObjectType::Schema
-                    | ObjectType::Connection => true,
-                    ObjectType::Database | ObjectType::User | ObjectType::Secret => {
+                    | ObjectType::Connection
+                    | ObjectType::Secret => true,
+                    ObjectType::Database | ObjectType::User => {
                         bail_not_implemented!("DROP CASCADE");
                     }
                 }
@@ -576,7 +581,8 @@ pub async fn handle(
                     .await
                 }
                 ObjectType::Secret => {
-                    drop_secret::handle_drop_secret(handler_args, object_name, if_exists).await
+                    drop_secret::handle_drop_secret(handler_args, object_name, if_exists, cascade)
+                        .await
                 }
             }
         }
@@ -688,7 +694,7 @@ pub async fn handle(
                 name,
                 table_name,
                 method,
-                columns.to_vec(),
+                columns.clone(),
                 include,
                 distributed_by,
             )
@@ -704,6 +710,7 @@ pub async fn handle(
                     name,
                     new_owner_name,
                     StatementType::ALTER_DATABASE,
+                    None,
                 )
                 .await
             }
@@ -786,6 +793,7 @@ pub async fn handle(
                     name,
                     new_owner_name,
                     StatementType::ALTER_SCHEMA,
+                    None,
                 )
                 .await
             }
@@ -815,6 +823,7 @@ pub async fn handle(
                     name,
                     new_owner_name,
                     StatementType::ALTER_TABLE,
+                    None,
                 )
                 .await
             }
@@ -823,6 +832,19 @@ pub async fn handle(
                 deferred,
             } => {
                 alter_parallelism::handle_alter_parallelism(
+                    handler_args,
+                    name,
+                    parallelism,
+                    StatementType::ALTER_TABLE,
+                    deferred,
+                )
+                .await
+            }
+            AlterTableOperation::SetBackfillParallelism {
+                parallelism,
+                deferred,
+            } => {
+                alter_parallelism::handle_alter_backfill_parallelism(
                     handler_args,
                     name,
                     parallelism,
@@ -847,7 +869,8 @@ pub async fn handle(
             AlterTableOperation::SetSourceRateLimit { rate_limit } => {
                 alter_streaming_rate_limit::handle_alter_streaming_rate_limit(
                     handler_args,
-                    PbThrottleTarget::TableWithSource,
+                    PbThrottleTarget::Table,
+                    risingwave_pb::common::PbThrottleType::Source,
                     name,
                     rate_limit,
                 )
@@ -860,16 +883,36 @@ pub async fn handle(
             AlterTableOperation::SetDmlRateLimit { rate_limit } => {
                 alter_streaming_rate_limit::handle_alter_streaming_rate_limit(
                     handler_args,
-                    PbThrottleTarget::TableDml,
+                    PbThrottleTarget::Table,
+                    risingwave_pb::common::PbThrottleType::Dml,
                     name,
                     rate_limit,
+                )
+                .await
+            }
+            AlterTableOperation::SetConfig { entries } => {
+                alter_streaming_config::handle_alter_streaming_set_config(
+                    handler_args,
+                    name,
+                    entries,
+                    StatementType::ALTER_TABLE,
+                )
+                .await
+            }
+            AlterTableOperation::ResetConfig { keys } => {
+                alter_streaming_config::handle_alter_streaming_reset_config(
+                    handler_args,
+                    name,
+                    keys,
+                    StatementType::ALTER_TABLE,
                 )
                 .await
             }
             AlterTableOperation::SetBackfillRateLimit { rate_limit } => {
                 alter_streaming_rate_limit::handle_alter_streaming_rate_limit(
                     handler_args,
-                    PbThrottleTarget::CdcTable,
+                    PbThrottleTarget::Table,
+                    risingwave_pb::common::PbThrottleType::Backfill,
                     name,
                     rate_limit,
                 )
@@ -915,6 +958,37 @@ pub async fn handle(
                 )
                 .await
             }
+            AlterIndexOperation::SetBackfillParallelism {
+                parallelism,
+                deferred,
+            } => {
+                alter_parallelism::handle_alter_backfill_parallelism(
+                    handler_args,
+                    name,
+                    parallelism,
+                    StatementType::ALTER_INDEX,
+                    deferred,
+                )
+                .await
+            }
+            AlterIndexOperation::SetConfig { entries } => {
+                alter_streaming_config::handle_alter_streaming_set_config(
+                    handler_args,
+                    name,
+                    entries,
+                    StatementType::ALTER_INDEX,
+                )
+                .await
+            }
+            AlterIndexOperation::ResetConfig { keys } => {
+                alter_streaming_config::handle_alter_streaming_reset_config(
+                    handler_args,
+                    name,
+                    keys,
+                    StatementType::ALTER_INDEX,
+                )
+                .await
+            }
         },
         Statement::AlterView {
             materialized,
@@ -956,6 +1030,22 @@ pub async fn handle(
                     )
                     .await
                 }
+                AlterViewOperation::SetBackfillParallelism {
+                    parallelism,
+                    deferred,
+                } => {
+                    if !materialized {
+                        bail_not_implemented!("ALTER VIEW SET BACKFILL PARALLELISM");
+                    }
+                    alter_parallelism::handle_alter_backfill_parallelism(
+                        handler_args,
+                        name,
+                        parallelism,
+                        statement_type,
+                        deferred,
+                    )
+                    .await
+                }
                 AlterViewOperation::SetResourceGroup {
                     resource_group,
                     deferred,
@@ -978,6 +1068,7 @@ pub async fn handle(
                         name,
                         new_owner_name,
                         statement_type,
+                        None,
                     )
                     .await
                 }
@@ -998,6 +1089,7 @@ pub async fn handle(
                     alter_streaming_rate_limit::handle_alter_streaming_rate_limit(
                         handler_args,
                         PbThrottleTarget::Mv,
+                        risingwave_pb::common::PbThrottleType::Backfill,
                         name,
                         rate_limit,
                     )
@@ -1030,6 +1122,30 @@ pub async fn handle(
                     }
                     alter_mv::handle_alter_mv(handler_args, name, query).await
                 }
+                AlterViewOperation::SetConfig { entries } => {
+                    if !materialized {
+                        bail!("SET CONFIG is only supported for materialized views");
+                    }
+                    alter_streaming_config::handle_alter_streaming_set_config(
+                        handler_args,
+                        name,
+                        entries,
+                        statement_type,
+                    )
+                    .await
+                }
+                AlterViewOperation::ResetConfig { keys } => {
+                    if !materialized {
+                        bail!("RESET CONFIG is only supported for materialized views");
+                    }
+                    alter_streaming_config::handle_alter_streaming_reset_config(
+                        handler_args,
+                        name,
+                        keys,
+                        statement_type,
+                    )
+                    .await
+                }
             }
         }
 
@@ -1046,6 +1162,7 @@ pub async fn handle(
                     name,
                     new_owner_name,
                     StatementType::ALTER_SINK,
+                    None,
                 )
                 .await
             }
@@ -1072,6 +1189,37 @@ pub async fn handle(
                 )
                 .await
             }
+            AlterSinkOperation::SetBackfillParallelism {
+                parallelism,
+                deferred,
+            } => {
+                alter_parallelism::handle_alter_backfill_parallelism(
+                    handler_args,
+                    name,
+                    parallelism,
+                    StatementType::ALTER_SINK,
+                    deferred,
+                )
+                .await
+            }
+            AlterSinkOperation::SetConfig { entries } => {
+                alter_streaming_config::handle_alter_streaming_set_config(
+                    handler_args,
+                    name,
+                    entries,
+                    StatementType::ALTER_SINK,
+                )
+                .await
+            }
+            AlterSinkOperation::ResetConfig { keys } => {
+                alter_streaming_config::handle_alter_streaming_reset_config(
+                    handler_args,
+                    name,
+                    keys,
+                    StatementType::ALTER_SINK,
+                )
+                .await
+            }
             AlterSinkOperation::SwapRenameSink { target_sink } => {
                 alter_swap_rename::handle_swap_rename(
                     handler_args,
@@ -1085,6 +1233,17 @@ pub async fn handle(
                 alter_streaming_rate_limit::handle_alter_streaming_rate_limit(
                     handler_args,
                     PbThrottleTarget::Sink,
+                    risingwave_pb::common::PbThrottleType::Sink,
+                    name,
+                    rate_limit,
+                )
+                .await
+            }
+            AlterSinkOperation::SetBackfillRateLimit { rate_limit } => {
+                alter_streaming_rate_limit::handle_alter_streaming_rate_limit(
+                    handler_args,
+                    PbThrottleTarget::Sink,
+                    risingwave_pb::common::PbThrottleType::Backfill,
                     name,
                     rate_limit,
                 )
@@ -1110,6 +1269,7 @@ pub async fn handle(
                     name,
                     new_owner_name,
                     StatementType::ALTER_SUBSCRIPTION,
+                    None,
                 )
                 .await
             }
@@ -1156,6 +1316,7 @@ pub async fn handle(
                     name,
                     new_owner_name,
                     StatementType::ALTER_SOURCE,
+                    None,
                 )
                 .await
             }
@@ -1180,6 +1341,7 @@ pub async fn handle(
                 alter_streaming_rate_limit::handle_alter_streaming_rate_limit(
                     handler_args,
                     PbThrottleTarget::Source,
+                    risingwave_pb::common::PbThrottleType::Source,
                     name,
                     rate_limit,
                 )
@@ -1207,6 +1369,40 @@ pub async fn handle(
                 )
                 .await
             }
+            AlterSourceOperation::SetBackfillParallelism {
+                parallelism,
+                deferred,
+            } => {
+                alter_parallelism::handle_alter_backfill_parallelism(
+                    handler_args,
+                    name,
+                    parallelism,
+                    StatementType::ALTER_SOURCE,
+                    deferred,
+                )
+                .await
+            }
+            AlterSourceOperation::SetConfig { entries } => {
+                alter_streaming_config::handle_alter_streaming_set_config(
+                    handler_args,
+                    name,
+                    entries,
+                    StatementType::ALTER_SOURCE,
+                )
+                .await
+            }
+            AlterSourceOperation::ResetConfig { keys } => {
+                alter_streaming_config::handle_alter_streaming_reset_config(
+                    handler_args,
+                    name,
+                    keys,
+                    StatementType::ALTER_SOURCE,
+                )
+                .await
+            }
+            AlterSourceOperation::ResetSource => {
+                reset_source::handle_reset_source(handler_args, name).await
+            }
         },
         Statement::AlterFunction {
             name,
@@ -1218,6 +1414,16 @@ pub async fn handle(
                     handler_args,
                     name,
                     new_schema_name,
+                    StatementType::ALTER_FUNCTION,
+                    args,
+                )
+                .await
+            }
+            AlterFunctionOperation::ChangeOwner { new_owner_name } => {
+                alter_owner::handle_alter_owner(
+                    handler_args,
+                    name,
+                    new_owner_name,
                     StatementType::ALTER_FUNCTION,
                     args,
                 )
@@ -1241,6 +1447,15 @@ pub async fn handle(
                     name,
                     new_owner_name,
                     StatementType::ALTER_CONNECTION,
+                    None,
+                )
+                .await
+            }
+            AlterConnectionOperation::AlterConnectorProps { alter_props } => {
+                alter_connection_props::handle_alter_connection_connector_props(
+                    handler_args,
+                    name,
+                    alter_props,
                 )
                 .await
             }
@@ -1248,24 +1463,56 @@ pub async fn handle(
         Statement::AlterSystem { param, value } => {
             alter_system::handle_alter_system(handler_args, param, value).await
         }
-        Statement::AlterSecret {
-            name,
-            with_options,
-            operation,
-        } => alter_secret::handle_alter_secret(handler_args, name, with_options, operation).await,
+        Statement::AlterSecret { name, operation } => match operation {
+            AlterSecretOperation::ChangeCredential {
+                with_options,
+                new_credential,
+            } => {
+                alter_secret::handle_alter_secret(handler_args, name, with_options, new_credential)
+                    .await
+            }
+            AlterSecretOperation::ChangeOwner { new_owner_name } => {
+                alter_owner::handle_alter_owner(
+                    handler_args,
+                    name,
+                    new_owner_name,
+                    StatementType::ALTER_SECRET,
+                    None,
+                )
+                .await
+            }
+        },
         Statement::AlterFragment {
-            fragment_id,
-            operation: AlterFragmentOperation::AlterBackfillRateLimit { rate_limit },
-        } => {
-            alter_streaming_rate_limit::handle_alter_streaming_rate_limit_by_id(
-                &handler_args.session,
-                PbThrottleTarget::Fragment,
-                fragment_id,
-                rate_limit,
-                StatementType::SET_VARIABLE,
-            )
-            .await
-        }
+            fragment_ids,
+            operation,
+        } => match operation {
+            AlterFragmentOperation::AlterBackfillRateLimit { rate_limit } => {
+                let [fragment_id] = fragment_ids.as_slice() else {
+                    return Err(ErrorCode::InvalidInputSyntax(
+                        "ALTER FRAGMENT ... SET RATE_LIMIT supports exactly one fragment id"
+                            .to_owned(),
+                    )
+                    .into());
+                };
+                alter_streaming_rate_limit::handle_alter_streaming_rate_limit_by_id(
+                    &handler_args.session,
+                    PbThrottleTarget::Fragment,
+                    risingwave_pb::common::PbThrottleType::Backfill,
+                    *fragment_id,
+                    rate_limit,
+                    StatementType::SET_VARIABLE,
+                )
+                .await
+            }
+            AlterFragmentOperation::SetParallelism { parallelism } => {
+                alter_parallelism::handle_alter_fragment_parallelism(
+                    handler_args,
+                    fragment_ids.into_iter().map_into().collect(),
+                    parallelism,
+                )
+                .await
+            }
+        },
         Statement::AlterDefaultPrivileges { .. } => {
             handle_privilege::handle_alter_default_privileges(handler_args, stmt).await
         }
@@ -1349,26 +1596,25 @@ fn check_ban_ddl_for_iceberg_engine_table(
 
         Statement::AlterTable {
             name,
-            operation: AlterTableOperation::ChangeOwner { .. },
-        } => {
-            let (table, schema_name) = get_table_catalog_by_table_name(session.as_ref(), name)?;
-            if table.is_iceberg_engine_table() {
-                bail!(
-                    "ALTER TABLE CHANGE OWNER is not supported for iceberg table: {}.{}",
-                    schema_name,
-                    name
-                );
-            }
-        }
-
-        Statement::AlterTable {
-            name,
             operation: AlterTableOperation::SetParallelism { .. },
         } => {
             let (table, schema_name) = get_table_catalog_by_table_name(session.as_ref(), name)?;
             if table.is_iceberg_engine_table() {
                 bail!(
                     "ALTER TABLE SET PARALLELISM is not supported for iceberg table: {}.{}",
+                    schema_name,
+                    name
+                );
+            }
+        }
+        Statement::AlterTable {
+            name,
+            operation: AlterTableOperation::SetBackfillParallelism { .. },
+        } => {
+            let (table, schema_name) = get_table_catalog_by_table_name(session.as_ref(), name)?;
+            if table.is_iceberg_engine_table() {
+                bail!(
+                    "ALTER TABLE SET BACKFILL PARALLELISM is not supported for iceberg table: {}.{}",
                     schema_name,
                     name
                 );

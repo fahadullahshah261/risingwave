@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,1007 @@ macro_rules! debug {
         if DEBUG {
             println!("cargo:warning={}", format!($($tokens)*))
         }
+    }
+}
+
+macro_rules! for_all_wrapped_id_fields {
+    ($(
+        $outer_part:ident {
+            $(
+                $($type_part:ident).* {
+                    $(
+                        $field_name:ident: $type_name:ident $(-> $value_type_name:ident)?,
+                    )+
+                }
+            )+
+        }
+    )+) => {
+        fn wrapped_fields() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+            vec![
+                $($(
+                    (
+                        &concat!(stringify!($outer_part), $(stringify!(.$type_part)),*),
+                        vec![
+                            $(
+                                (stringify!($field_name), stringify!($type_name $(-> $value_type_name)?))
+                            ),*
+                        ]
+                    ),
+                )+)+
+            ]
+        }
+    };
+}
+
+for_all_wrapped_id_fields! (
+    backup_service {
+        MetaSnapshotMetadata {
+            hummock_version_id: HummockVersionId,
+            state_table_info: TableId,
+        }
+    }
+    batch_plan {
+        DeleteNode {
+            table_id: TableId,
+        }
+        InsertNode {
+            table_id: TableId,
+        }
+        SourceNode {
+            source_id: SourceId,
+        }
+        SysRowSeqScanNode {
+            table_id: TableId,
+        }
+        UpdateNode {
+            table_id: TableId,
+        }
+    }
+    catalog {
+        Comment {
+            table_id: TableId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+        }
+        Connection {
+            id: ConnectionId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            owner: UserId,
+        }
+        Database {
+            id: DatabaseId,
+            owner: UserId,
+        }
+        Function {
+            id: FunctionId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            owner: UserId,
+        }
+        Index {
+            id: IndexId,
+            index_table_id: TableId,
+            primary_table_id: TableId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            owner: UserId,
+        }
+        Schema {
+            id: SchemaId,
+            database_id: DatabaseId,
+            owner: UserId,
+        }
+        Secret {
+            id: SecretId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            owner: UserId,
+        }
+        Sink {
+            id: SinkId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            target_table: TableId,
+            auto_refresh_schema_from_table: TableId,
+            connection_id: ConnectionId,
+            owner: UserId,
+        }
+        SinkFormatDesc {
+            connection_id: ConnectionId,
+        }
+        Source {
+            id: SourceId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            connection_id: ConnectionId,
+            associated_table_id: TableId,
+            owner: UserId,
+        }
+        StreamSourceInfo {
+            connection_id: ConnectionId,
+        }
+        Subscription {
+            id: SubscriptionId,
+            dependent_table_id: TableId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            owner: UserId,
+        }
+        Table {
+            id: TableId,
+            primary_table_id: TableId,
+            job_id: JobId,
+            associated_source_id: SourceId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            fragment_id: FragmentId,
+            dml_fragment_id: FragmentId,
+            owner: UserId,
+        }
+        View {
+            id: ViewId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            owner: UserId,
+        }
+    }
+    common {
+        ActorInfo {
+            actor_id: ActorId,
+            partial_graph_id: PartialGraphId,
+        }
+        ActorLocation {
+            worker_node_id: WorkerId,
+        }
+        BatchQueryCommittedEpoch {
+            hummock_version_id: HummockVersionId,
+        }
+        WorkerNode {
+            id: WorkerId,
+        }
+    }
+    connector_service {
+        SinkParam {
+            sink_id: SinkId,
+        }
+    }
+    ddl_service {
+        AlterBackfillParallelismRequest {
+            table_id: JobId,
+        }
+        AlterCdcTableBackfillParallelismRequest {
+            table_id: JobId,
+        }
+        AlterDatabaseParamRequest {
+            database_id: DatabaseId,
+        }
+        AlterFragmentParallelismRequest {
+            fragment_ids: FragmentId,
+        }
+        AlterNameRequest {
+            table_id: TableId,
+            view_id: ViewId,
+            index_id: IndexId,
+            sink_id: SinkId,
+            source_id: SourceId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            subscription_id: SubscriptionId,
+        }
+        AlterOwnerRequest {
+            table_id: TableId,
+            view_id: ViewId,
+            source_id: SourceId,
+            sink_id: SinkId,
+            schema_id: SchemaId,
+            database_id: DatabaseId,
+            subscription_id: SubscriptionId,
+            connection_id: ConnectionId,
+            secret_id: SecretId,
+            function_id: FunctionId,
+            owner_id: UserId,
+        }
+        AlterParallelismRequest {
+            table_id: JobId,
+        }
+        AlterResourceGroupRequest {
+            table_id: TableId,
+        }
+        AlterSecretRequest {
+            database_id: DatabaseId,
+            schema_id: SchemaId,
+            secret_id: SecretId,
+            owner_id: UserId,
+        }
+        AlterSetSchemaRequest {
+            table_id: TableId,
+            view_id: ViewId,
+            source_id: SourceId,
+            sink_id: SinkId,
+            function_id: FunctionId,
+            connection_id: ConnectionId,
+            subscription_id: SubscriptionId,
+            new_schema_id: SchemaId,
+        }
+        AlterStreamingJobConfigRequest {
+            job_id: JobId,
+        }
+        AlterSwapRenameRequest.ObjectNameSwapPair {
+            src_object_id: ObjectId,
+            dst_object_id: ObjectId,
+        }
+        CompactIcebergTableRequest {
+            sink_id: SinkId,
+        }
+        CreateConnectionRequest {
+            database_id: DatabaseId,
+            schema_id: SchemaId,
+            owner_id: UserId,
+        }
+        CreateMaterializedViewRequest {
+            dependencies: ObjectId,
+            owner_id: UserId,
+        }
+        CreateSecretRequest {
+            database_id: DatabaseId,
+            schema_id: SchemaId,
+            owner_id: UserId,
+        }
+        CreateSinkRequest {
+            dependencies: ObjectId,
+            owner_id: UserId,
+        }
+        CreateTableRequest {
+            dependencies: ObjectId,
+        }
+        CreateViewRequest {
+            dependencies: ObjectId,
+        }
+        DropConnectionRequest {
+            connection_id: ConnectionId,
+        }
+        DropDatabaseRequest {
+            database_id: DatabaseId,
+        }
+        DropFunctionRequest {
+            function_id: FunctionId,
+        }
+        DropIndexRequest {
+            index_id: IndexId,
+        }
+        DropMaterializedViewRequest {
+            table_id: TableId,
+        }
+        DropSchemaRequest {
+            schema_id: SchemaId,
+        }
+        DropSecretRequest {
+            secret_id: SecretId,
+        }
+        DropSinkRequest {
+            sink_id: SinkId,
+        }
+        DropSourceRequest {
+            source_id: SourceId,
+        }
+        DropSubscriptionRequest {
+            subscription_id: SubscriptionId,
+        }
+        DropTableRequest {
+            id: SourceId,
+            table_id: TableId,
+        }
+        DropViewRequest {
+            view_id: ViewId,
+        }
+        ExpireIcebergTableSnapshotsRequest {
+            sink_id: SinkId,
+        }
+        GetTablesRequest {
+            table_ids: TableId,
+        }
+        GetTablesResponse {
+            tables: TableId,
+        }
+        ResetSourceRequest {
+            source_id: SourceId,
+        }
+        RisectlResumeBackfillRequest {
+            job_id: JobId,
+            fragment_id: FragmentId,
+        }
+        WaitVersion {
+            hummock_version_id: HummockVersionId,
+        }
+    }
+    frontend_service {
+        GetTableReplacePlanRequest {
+            table_id: TableId,
+            database_id: DatabaseId,
+        }
+    }
+    hummock {
+        BranchedObject {
+            object_id: HummockSstableObjectId,
+            sst_id: HummockSstableId,
+            compaction_group_id: CompactionGroupId,
+        }
+        CancelCompactTask {
+            context_id: WorkerId,
+        }
+        CompactStatus {
+            compaction_group_id: CompactionGroupId,
+        }
+        CompactTask {
+            compaction_group_id: CompactionGroupId,
+            existing_table_ids: TableId,
+            table_options: TableId,
+            table_vnode_partition: TableId,
+            table_watermarks: TableId,
+            table_schemas: TableId,
+        }
+        CompactTaskAssignment {
+            context_id: WorkerId,
+        }
+        CompactTaskProgress {
+            compaction_group_id: CompactionGroupId,
+        }
+        CompactionGroup {
+            id: CompactionGroupId,
+        }
+        CompactionGroupInfo {
+            id: CompactionGroupId,
+            parent_id: CompactionGroupId,
+            member_table_ids: TableId,
+        }
+        GetCompactionScoreRequest {
+            compaction_group_id: CompactionGroupId,
+        }
+        GetCompactionScoreResponse {
+            compaction_group_id: CompactionGroupId,
+        }
+        GetNewObjectIdsResponse {
+            start_id: HummockRawObjectId,
+            end_id: HummockRawObjectId,
+        }
+        GetVersionByEpochRequest {
+            table_id: TableId,
+        }
+
+        GroupConstruct {
+            new_sst_start_id: HummockSstableId,
+            parent_group_id: CompactionGroupId,
+            group_id: CompactionGroupId,
+        }
+        GroupMerge {
+            left_group_id: CompactionGroupId,
+            right_group_id: CompactionGroupId,
+        }
+        HnswGraphFileInfo {
+            object_id: HummockHnswGraphFileId,
+        }
+        HummockPinnedSnapshot {
+            context_id: WorkerId,
+        }
+        HummockPinnedVersion {
+            context_id: WorkerId,
+            min_pinned_id: HummockVersionId,
+        }
+        HummockVersion {
+            id: HummockVersionId,
+            table_watermarks: TableId,
+            table_change_logs: TableId,
+            state_table_info: TableId,
+            vector_indexes: TableId,
+            levels: CompactionGroupId,
+        }
+        HummockVersion.Levels {
+            group_id: CompactionGroupId,
+            parent_group_id: CompactionGroupId,
+        }
+        HummockVersionCheckpoint {
+            stale_objects: HummockVersionId,
+        }
+        HummockVersionCheckpoint.StaleObjects {
+            id: HummockSstableObjectId,
+        }
+        HummockVersionDelta {
+            id: HummockVersionId,
+            prev_id: HummockVersionId,
+            new_table_watermarks: TableId,
+            removed_table_ids: TableId,
+            change_log_delta: TableId,
+            state_table_info_delta: TableId,
+            vector_index_delta: TableId,
+            group_deltas: CompactionGroupId,
+        }
+        HummockVersionStats {
+            hummock_version_id: HummockVersionId,
+            table_stats: TableId,
+        }
+        IntraLevelDelta {
+            removed_table_ids: HummockSstableId,
+        }
+        LevelHandler.RunningCompactTask {
+            ssts: HummockSstableId,
+        }
+        ListActiveWriteLimitResponse {
+            write_limits: CompactionGroupId,
+        }
+        ListVersionDeltasRequest {
+            start_id: HummockVersionId,
+        }
+        MergeCompactionGroupRequest {
+            left_group_id: CompactionGroupId,
+            right_group_id: CompactionGroupId,
+        }
+        PinVersionRequest {
+            context_id: WorkerId,
+        }
+        PinnedVersionsSummary {
+            workers: WorkerId,
+        }
+        ReplayVersionDeltaResponse {
+            modified_compaction_groups: CompactionGroupId,
+        }
+        ReportCompactionTaskRequest.ReportTask {
+            table_stats_change: TableId,
+            object_timestamps: HummockSstableObjectId,
+        }
+        RiseCtlUpdateCompactionConfigRequest {
+            compaction_group_ids: CompactionGroupId,
+        }
+        SplitCompactionGroupRequest {
+            group_id: CompactionGroupId,
+            table_ids: TableId,
+        }
+        SplitCompactionGroupResponse {
+            new_group_id: CompactionGroupId,
+        }
+        SstableInfo {
+            object_id: HummockSstableObjectId,
+            sst_id: HummockSstableId,
+            table_ids: TableId,
+        }
+        StateTableInfo {
+            compaction_group_id: CompactionGroupId,
+        }
+        StateTableInfoDelta {
+            compaction_group_id: CompactionGroupId,
+        }
+        SubscribeCompactionEventRequest.Register {
+            context_id: WorkerId,
+        }
+        SubscribeCompactionEventRequest.ReportTask {
+            table_stats_change: TableId,
+            object_timestamps: HummockSstableObjectId,
+        }
+        TriggerCompactionDeterministicRequest {
+            version_id: HummockVersionId,
+            compaction_groups: CompactionGroupId,
+        }
+        TriggerManualCompactionRequest {
+            compaction_group_id: CompactionGroupId,
+            table_id: JobId,
+            sst_ids: HummockSstableId,
+        }
+        TruncateTables {
+            table_ids: TableId,
+        }
+        UnpinVersionBeforeRequest {
+            context_id: WorkerId,
+            unpin_version_before: HummockVersionId,
+        }
+        UnpinVersionRequest {
+            context_id: WorkerId,
+        }
+        VacuumTask {
+            sstable_object_ids: HummockSstableObjectId,
+        }
+        ValidationTask {
+            sst_id_to_worker_id: HummockSstableObjectId->WorkerId,
+        }
+        VectorFileInfo {
+            object_id: HummockVectorFileId,
+        }
+        VectorIndexObject {
+            id: HummockRawObjectId,
+        }
+        WriteLimits {
+            write_limits: CompactionGroupId,
+        }
+        WriteLimits.WriteLimit {
+            table_ids: TableId,
+        }
+    }
+    iceberg_compaction {
+        SubscribeIcebergCompactionEventRequest.Register {
+            context_id: WorkerId,
+        }
+    }
+    meta {
+        ActivateWorkerNodeRequest {
+            node_id: WorkerId,
+        }
+        ActorCountPerParallelism {
+            worker_id_to_actor_count: WorkerId,
+        }
+        ActorIds {
+            ids: ActorId,
+        }
+        AddWorkerNodeResponse {
+            node_id: WorkerId,
+        }
+        AlterConnectorPropsRequest {
+            connector_conn_ref: ConnectionId,
+        }
+        AlterConnectorPropsRequest.AlterIcebergTableIds {
+            sink_id: SinkId,
+            source_id: SourceId,
+        }
+        CancelCreatingJobsRequest.CreatingJobIds {
+            job_ids: JobId,
+        }
+        CancelCreatingJobsRequest.CreatingJobInfo {
+            database_id: DatabaseId,
+            schema_id: SchemaId,
+        }
+        DatabaseRecoveryFailure {
+            database_id: DatabaseId,
+        }
+        DatabaseRecoveryStart {
+            database_id: DatabaseId,
+        }
+        DatabaseRecoverySuccess {
+            database_id: DatabaseId,
+        }
+        EventLog.EventAutoSchemaChangeFail {
+            table_id: TableId,
+        }
+        EventLog.EventCreateStreamJobFail {
+            id: JobId,
+        }
+        EventLog.EventDirtyStreamJobClear {
+            id: JobId,
+        }
+        EventLog.EventSinkFail {
+            sink_id: SinkId,
+        }
+        EventLog.EventWorkerNodePanic {
+            worker_id: WorkerId,
+        }
+        EventLog.GlobalRecoverySuccess {
+            running_database_ids: DatabaseId,
+            recovering_database_ids: DatabaseId,
+        }
+        FlushRequest {
+            database_id: DatabaseId,
+        }
+        FlushResponse {
+            hummock_version_id: HummockVersionId,
+        }
+        FragmentDistribution {
+            fragment_id: FragmentId,
+            upstream_fragment_ids: FragmentId,
+            table_id: JobId,
+            state_table_ids: TableId,
+        }
+        FragmentIdToActorIdMap {
+            map: FragmentId,
+        }
+        FragmentToRelationMap {
+            fragment_to_relation_map: FragmentId->JobId,
+        }
+        FragmentWorkerSlotMapping {
+            fragment_id: FragmentId,
+        }
+        GetActorVnodesRequest {
+            actor_id: ActorId,
+        }
+        GetClusterInfoResponse {
+            actor_splits: ActorId,
+            source_infos: SourceId,
+        }
+        GetFragmentByIdRequest {
+            fragment_id: FragmentId,
+        }
+        GetFragmentVnodesRequest {
+            fragment_id: FragmentId,
+        }
+        GetFragmentVnodesResponse.ActorVnodes {
+            actor_id: ActorId,
+        }
+        GetServerlessStreamingJobsStatusResponse.Status {
+            table_id: TableId,
+        }
+        GetServingVnodeMappingsResponse {
+            fragment_to_table: FragmentId->JobId,
+        }
+        HeartbeatRequest {
+            node_id: WorkerId,
+        }
+        ListActorSplitsResponse.ActorSplit {
+            actor_id: ActorId,
+            fragment_id: FragmentId,
+            source_id: SourceId,
+        }
+        ListActorStatesResponse.ActorState {
+            actor_id: ActorId,
+            fragment_id: FragmentId,
+            worker_id: WorkerId,
+        }
+        ListCdcProgressResponse {
+            cdc_progress: JobId,
+        }
+        ListRateLimitsResponse.RateLimitInfo {
+            job_id: JobId,
+            fragment_id: FragmentId,
+        }
+        ListRefreshTableStatesResponse.RefreshTableState {
+            table_id: TableId,
+        }
+        ListStreamingJobStatesResponse.StreamingJobState {
+            table_id: JobId,
+            database_id: DatabaseId,
+            schema_id: SchemaId,
+        }
+        ListTableFragmentsRequest {
+            table_ids: JobId,
+        }
+        ListTableFragmentsResponse {
+            table_fragments: JobId,
+        }
+        ListTableFragmentsResponse.ActorInfo {
+            id: ActorId,
+            partial_graph_id: PartialGraphId,
+        }
+        ListTableFragmentsResponse.FragmentInfo {
+            id: FragmentId,
+        }
+        ListUnmigratedTablesResponse.UnmigratedTable {
+            table_id: TableId,
+        }
+        ObjectDependency {
+            object_id: ObjectId,
+            referenced_object_id: ObjectId,
+        }
+        RefreshRequest {
+            table_id: TableId,
+            associated_source_id: SourceId,
+        }
+        SetSyncLogStoreAlignedRequest {
+            job_id: JobId,
+        }
+        SubscribeRequest {
+            worker_id: WorkerId,
+        }
+        TableFragments {
+            table_id: JobId,
+            fragments: FragmentId,
+            actor_status: ActorId,
+        }
+        TableFragments.Fragment {
+            fragment_id: FragmentId,
+            upstream_fragment_ids: FragmentId,
+            state_table_ids: TableId,
+            table_id: JobId,
+        }
+        UpdateWorkerNodeSchedulabilityRequest {
+            worker_ids: WorkerId,
+        }
+        WorkerReschedule {
+            worker_actor_diff: WorkerId,
+        }
+    }
+    monitor_service {
+        GetProfileStatsRequest {
+            executor_ids: ExecutorId,
+            dispatcher_fragment_ids: FragmentId,
+        }
+        GetProfileStatsResponse {
+            dispatch_fragment_output_row_count: FragmentId,
+            dispatch_fragment_output_blocking_duration_ns: FragmentId,
+            stream_node_output_row_count: ExecutorId,
+            stream_node_output_blocking_duration_ns: ExecutorId,
+        }
+        StackTraceResponse {
+            barrier_worker_state: WorkerId,
+            jvm_stack_traces: WorkerId,
+            node_errors: WorkerId,
+        }
+    }
+    plan_common {
+        ExternalTableDesc {
+            table_id: TableId,
+            source_id: SourceId,
+        }
+        StorageTableDesc {
+            table_id: TableId,
+        }
+        VectorIndexReaderDesc {
+            table_id: TableId,
+        }
+    }
+    recursive {
+        ComplexRecursiveMessage {
+            node_id: WorkerId,
+        }
+    }
+    secret {
+        SecretRef {
+            secret_id: SecretId,
+        }
+    }
+    source {
+        CdcTableSnapshotSplitsWithGeneration {
+            splits: ActorId,
+        }
+        SourceActorInfo {
+            actor_id: ActorId,
+        }
+    }
+    stream_plan {
+        ActorMapping {
+            data: ActorId,
+        }
+        AddMutation {
+            new_upstream_sinks: FragmentId,
+            backfill_nodes_to_pause: FragmentId,
+            added_actors: ActorId,
+            actor_splits: ActorId,
+            actor_dispatchers: ActorId,
+        }
+        BackfillOrder {
+            order: RelationId,
+        }
+        CdcFilterNode {
+            upstream_source_id: SourceId,
+        }
+        DeltaIndexJoinNode {
+            left_table_id: TableId,
+            right_table_id: TableId,
+        }
+        Dispatcher {
+            downstream_actor_id: ActorId,
+            dispatcher_id: FragmentId,
+        }
+        DmlNode {
+            table_id: TableId,
+        }
+        ListFinishMutation {
+            associated_source_id: SourceId,
+        }
+        LoadFinishMutation {
+            associated_source_id: SourceId,
+        }
+        LookupNode {
+            table_id: TableId,
+            index_id: TableId,
+        }
+        MaterializeNode {
+            table_id: TableId,
+        }
+        MergeNode {
+            upstream_fragment_id: FragmentId,
+        }
+        RefreshStartMutation {
+            table_id: TableId,
+            associated_source_id: SourceId,
+        }
+        SinkDesc {
+            id: SinkId,
+        }
+        SourceBackfillNode {
+            upstream_source_id: SourceId,
+        }
+        SourceChangeSplitMutation {
+            actor_splits: ActorId,
+        }
+        StartFragmentBackfillMutation {
+            fragment_ids: FragmentId,
+        }
+        StopMutation {
+            dropped_sink_fragments: FragmentId,
+            actors: ActorId,
+        }
+        StreamActor {
+            actor_id: ActorId,
+            fragment_id: FragmentId,
+        }
+        StreamCdcScanNode {
+            table_id: TableId,
+        }
+        StreamFragmentGraph {
+            dependent_table_ids: TableId,
+            fragments: FragmentId,
+        }
+        StreamFragmentGraph.StreamFragment {
+            fragment_id: FragmentId,
+        }
+        StreamFragmentGraph.StreamFragmentEdge {
+            upstream_id: FragmentId,
+            downstream_id: FragmentId,
+        }
+        StreamFsFetch {
+            source_id: SourceId,
+            associated_table_id: TableId,
+        }
+        StreamNode {
+            operator_id: StreamNodeLocalOperatorId,
+        }
+        StreamScanNode {
+            table_id: TableId,
+        }
+        StreamSource {
+            source_id: SourceId,
+            associated_table_id: TableId,
+        }
+        SubscriptionUpstreamInfo {
+            subscriber_id: SubscriberId,
+            upstream_mv_table_id: TableId,
+        }
+        ThrottleMutation {
+            fragment_throttle: FragmentId,
+        }
+        UpdateMutation {
+            dropped_actors: ActorId,
+            actor_splits: ActorId,
+            actor_vnode_bitmap_update: ActorId,
+            actor_new_dispatchers: ActorId,
+            sink_add_columns: SinkId,
+        }
+        UpdateMutation.DispatcherUpdate {
+            actor_id: ActorId,
+            dispatcher_id: FragmentId,
+            added_downstream_actor_id: ActorId,
+            removed_downstream_actor_id: ActorId,
+        }
+        UpdateMutation.MergeUpdate {
+            upstream_fragment_id: FragmentId,
+            new_upstream_fragment_id: FragmentId,
+            actor_id: ActorId,
+            removed_upstream_actor_id: ActorId,
+            actor_vnode_bitmap_update: ActorId,
+            dropped_actors: ActorId,
+            actor_splits: ActorId,
+            actor_new_dispatchers: ActorId,
+        }
+        UpstreamSinkInfo {
+            upstream_fragment_id: FragmentId,
+        }
+        VectorIndexLookupJoinNode {
+            table_id: TableId,
+        }
+    }
+    stream_service {
+        BarrierCompleteResponse {
+            truncate_tables: TableId,
+            refresh_finished_tables: TableId,
+            table_watermarks: TableId,
+            vector_index_adds: TableId,
+            worker_id: WorkerId,
+            list_finished_source_ids: SourceId,
+            load_finished_source_ids: SourceId,
+            partial_graph_id: PartialGraphId,
+        }
+        BarrierCompleteResponse.CdcTableBackfillProgress {
+            fragment_id: FragmentId,
+            actor_id: ActorId,
+        }
+        BarrierCompleteResponse.CreateMviewProgress {
+            backfill_actor_id: ActorId,
+            fragment_id: FragmentId,
+        }
+        BarrierCompleteResponse.ListFinishedSource {
+            reporter_actor_id: ActorId,
+            table_id: TableId,
+            associated_source_id: SourceId,
+        }
+        BarrierCompleteResponse.LoadFinishedSource {
+            reporter_actor_id: ActorId,
+            table_id: TableId,
+            associated_source_id: SourceId,
+        }
+        BarrierCompleteResponse.LocalSstableInfo {
+            table_stats_map: TableId,
+        }
+        GetMinUncommittedObjectIdResponse {
+            min_uncommitted_object_id: HummockRawObjectId,
+        }
+        InjectBarrierRequest {
+            table_ids_to_sync: TableId,
+            actor_ids_to_collect: ActorId,
+            partial_graph_id: PartialGraphId,
+        }
+        InjectBarrierRequest.BuildActorInfo {
+            fragment_upstreams: FragmentId,
+            actor_id: ActorId,
+            initial_subscriber_ids: SubscriberId,
+        }
+        InjectBarrierRequest.FragmentBuildActorInfo {
+            fragment_id: FragmentId,
+        }
+        StreamingControlStreamRequest.CreatePartialGraphRequest {
+            partial_graph_id: PartialGraphId,
+        }
+        StreamingControlStreamRequest.RemovePartialGraphRequest {
+            partial_graph_ids: PartialGraphId,
+        }
+        StreamingControlStreamRequest.ResetPartialGraphsRequest {
+            partial_graph_ids: PartialGraphId,
+        }
+        StreamingControlStreamResponse.ReportPartialGraphFailureResponse {
+            partial_graph_id: PartialGraphId,
+        }
+        StreamingControlStreamResponse.ResetPartialGraphResponse {
+            partial_graph_id: PartialGraphId,
+        }
+    }
+    task_service {
+        FastInsertRequest {
+            table_id: TableId,
+        }
+        GetStreamRequest.Get {
+            up_partial_graph_id: PartialGraphId,
+            up_fragment_id: FragmentId,
+            down_fragment_id: FragmentId,
+            up_actor_id: ActorId,
+            down_actor_id: ActorId,
+        }
+    }
+    user {
+        AlterDefaultPrivilegeRequest {
+            database_id: DatabaseId,
+            schema_ids: SchemaId,
+            user_ids: UserId,
+            granted_by: UserId,
+        }
+        AlterDefaultPrivilegeRequest.GrantPrivilege {
+            grantees: UserId,
+        }
+        AlterDefaultPrivilegeRequest.RevokePrivilege {
+            grantees: UserId,
+        }
+        DropUserRequest {
+            user_id: UserId,
+        }
+        GrantPrivilege {
+            database_id: DatabaseId,
+            schema_id: SchemaId,
+            table_id: TableId,
+            source_id: SourceId,
+            sink_id: SinkId,
+            view_id: ViewId,
+            function_id: FunctionId,
+            subscription_id: SubscriptionId,
+            connection_id: ConnectionId,
+            secret_id: SecretId,
+        }
+        GrantPrivilege.ActionWithGrantOption {
+            granted_by: UserId,
+        }
+        GrantPrivilegeRequest {
+            user_ids: UserId,
+            granted_by: UserId,
+        }
+        RevokePrivilegeRequest {
+            user_ids: UserId,
+            granted_by: UserId,
+            revoke_by: UserId,
+        }
+        UserInfo {
+            id: UserId,
+        }
+    }
+);
+
+fn check_declared_wrapped_fields_sorted() {
+    let wrapped_fields = wrapped_fields();
+    if let Some(i) =
+        (0..wrapped_fields.len() - 1).find(|i| wrapped_fields[*i].0 >= wrapped_fields[*i + 1].0)
+    {
+        panic!("types not sorted: first {}", wrapped_fields[i + 1].0)
     }
 }
 
@@ -170,6 +1171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .boxed(".stream_plan.StreamNode.node_body.sync_log_store")
         .boxed(".stream_plan.StreamNode.node_body.materialized_exprs")
         .boxed(".stream_plan.StreamNode.node_body.vector_index_write")
+        .boxed(".stream_plan.StreamNode.node_body.locality_provider")
+        .boxed(".stream_plan.StreamNode.node_body.eowc_gap_fill")
+        .boxed(".stream_plan.StreamNode.node_body.gap_fill")
+        .boxed(".stream_plan.StreamNode.node_body.vector_index_lookup_join")
         // `Udf` is 248 bytes, while 2nd largest field is 32 bytes.
         .boxed(".expr.ExprNode.rex_node.udf")
         // Eq + Hash are for plan nodes to do common sub-plan detection.
@@ -198,6 +1203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute("plan_common.ExternalTableDesc", "#[derive(Eq, Hash)]")
         .type_attribute("plan_common.ColumnDesc", "#[derive(Eq, Hash)]")
         .type_attribute("plan_common.AdditionalColumn", "#[derive(Eq, Hash)]")
+        .type_attribute("plan_common.AdditionalColumnPulsarMessageIdData", "#[derive(Eq, Hash)]")
         .type_attribute(
             "plan_common.AdditionalColumn.column_type",
             "#[derive(Eq, Hash)]",
@@ -224,6 +1230,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute("plan_common.AdditionalSchemaName", "#[derive(Eq, Hash)]")
         .type_attribute("plan_common.AdditionalTableName", "#[derive(Eq, Hash)]")
         .type_attribute("plan_common.AdditionalSubject", "#[derive(Eq, Hash)]")
+        .type_attribute("plan_common.SourceRefreshMode", "#[derive(Eq, Hash)]")
+        .type_attribute("plan_common.SourceRefreshMode.refresh_mode", "#[derive(Eq, Hash)]")
+        .type_attribute("plan_common.SourceRefreshMode.SourceRefreshModeStreaming", "#[derive(Eq, Hash)]")
+        .type_attribute("plan_common.SourceRefreshMode.SourceRefreshModeFullReload", "#[derive(Eq, Hash)]")
         .type_attribute(
             "plan_common.AdditionalCollectionName",
             "#[derive(Eq, Hash)]",
@@ -286,6 +1296,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[derive(prost_helpers::Version)]",
         )
         .type_attribute("expr.UdfExprVersion", "#[derive(prost_helpers::Version)]")
+        .type_attribute("meta.Object.object_info", "#[derive(strum::Display)]")
+        .type_attribute("meta.SubscribeResponse.info", "#[derive(strum::Display)]")
         // end
         ;
 
@@ -298,6 +1310,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // TODO:
         //"stream_plan.StreamNode"
     ]);
+
+    check_declared_wrapped_fields_sorted();
+
+    for (wrapped_type, wrapped_fields) in &wrapped_fields() {
+        for (field_name, field_type) in wrapped_fields {
+            let field_wrapper = if let Some((key_type, value_type)) = field_type.split_once("->") {
+                format!("crate::id::{key_type}->crate::id::{value_type}")
+            } else {
+                format!("crate::id::{field_type}")
+            };
+            prost_config.field_wrapper(format!("{wrapped_type}.{field_name}"), field_wrapper);
+        }
+    }
     // Compile the proto files.
     tonic_config
         .out_dir(out_dir.as_path())
@@ -319,10 +1344,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for serde_proto_file in &rewrite_files {
         let out_file = out_dir.join(format!("{}.serde.rs", serde_proto_file));
         let file_content = String::from_utf8(fs_err::read(&out_file)?)?;
+        let file_content = file_content.replace(
+            ".map(|(k,v)| (k.0, v)).collect()",
+            ".map(|(k,v)| (k.0.into(), v)).collect()",
+        );
+        let file_content = file_content.replace(
+            ".map(|(k,v)| (k.0, v.0)).collect()",
+            ".map(|(k,v)| (k.0.into(), v.0.into())).collect()",
+        );
         let module_path_id = serde_proto_file.replace('.', "::");
         fs_err::write(
             &out_file,
-            format!("use crate::{}::*;\n{}", module_path_id, file_content),
+            format!(
+                "#![allow(clippy::useless_conversion)]\nuse crate::{}::*;\n{}",
+                module_path_id, file_content
+            ),
         )?;
     }
 

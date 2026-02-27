@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2024 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -533,6 +533,7 @@ mod tests {
     use risingwave_common::bitmap::Bitmap;
     use risingwave_common::catalog::TableId;
     use risingwave_common::hash::VirtualNode;
+    use risingwave_common::id::FragmentId;
     use risingwave_common::util::epoch::test_epoch;
     use risingwave_hummock_sdk::EpochWithGap;
     use risingwave_hummock_sdk::key::{TableKey, UserKey};
@@ -697,6 +698,7 @@ mod tests {
         let mut local = state_store
             .new_local(NewLocalOptions {
                 table_id,
+                fragment_id: FragmentId::default(),
                 op_consistency_level: OpConsistencyLevel::ConsistentOldValue {
                     check_old_value: CHECK_BYTES_EQUAL.clone(),
                     is_log_store: true,

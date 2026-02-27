@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,10 @@
 
 use core::ops::Bound::Unbounded;
 
-use risingwave_common::catalog::TableId;
+use risingwave_common::catalog::TableOption;
 use risingwave_common::util::epoch::is_max_epoch;
 use risingwave_hummock_sdk::HummockReadEpoch;
+use risingwave_pb::id::TableId;
 use risingwave_storage::StateStore;
 use risingwave_storage::hummock::CachePolicy;
 use risingwave_storage::store::{
@@ -29,7 +30,7 @@ use crate::common::HummockServiceOpts;
 pub async fn list_kv(
     context: &CtlContext,
     epoch: u64,
-    table_id: u32,
+    table_id: TableId,
     data_dir: Option<String>,
     use_new_object_prefix_strategy: bool,
 ) -> anyhow::Result<()> {
@@ -47,7 +48,8 @@ pub async fn list_kv(
         .new_read_snapshot(
             HummockReadEpoch::Committed(epoch),
             NewReadSnapshotOptions {
-                table_id: TableId { table_id },
+                table_id,
+                table_option: TableOption::default(),
             },
         )
         .await?;
@@ -63,7 +65,7 @@ pub async fn list_kv(
         .await?;
     while let Some(item) = scan_result.try_next().await? {
         let (k, v) = item;
-        let print_string = format!("[t{}]", k.user_key.table_id.table_id());
+        let print_string = format!("[t{}]", k.user_key.table_id);
         println!("{} {:?} => {:?}", print_string, k, v)
     }
     Ok(())

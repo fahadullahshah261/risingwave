@@ -1,18 +1,4 @@
-// Copyright 2025 RisingWave Labs
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// Copyright 2025 RisingWave Labs
+// Copyright 2024 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -40,7 +26,9 @@ use itertools::Itertools;
 use parking_lot::Mutex;
 use rand::rng as thread_rng;
 use rand::seq::SliceRandom;
+use risingwave_common::catalog::TableId;
 use risingwave_common::config::meta::default::compaction_config;
+use risingwave_common::hash::VnodeCountCompat;
 use risingwave_common::util::epoch::Epoch;
 use risingwave_hummock_sdk::compact_task::{CompactTask, ReportTask};
 use risingwave_hummock_sdk::compaction_group::StateTableId;
@@ -53,8 +41,8 @@ use risingwave_hummock_sdk::table_stats::{
 use risingwave_hummock_sdk::table_watermark::WatermarkSerdeType;
 use risingwave_hummock_sdk::version::{GroupDelta, IntraLevelDelta};
 use risingwave_hummock_sdk::{
-    CompactionGroupId, HummockCompactionTaskId, HummockSstableId, HummockSstableObjectId,
-    HummockVersionId, compact_task_to_string, statistics_compact_task,
+    CompactionGroupId, HummockCompactionTaskId, HummockContextId, HummockSstableId,
+    HummockSstableObjectId, HummockVersionId, compact_task_to_string, statistics_compact_task,
 };
 use risingwave_pb::hummock::compact_task::{TaskStatus, TaskType};
 use risingwave_pb::hummock::subscribe_compaction_event_response::Event as ResponseEvent;
@@ -65,7 +53,6 @@ use risingwave_pb::hummock::{
 use thiserror_ext::AsReport;
 use tokio::sync::RwLockWriteGuard;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 use tonic::Streaming;
@@ -111,8 +98,6 @@ static CANCEL_STATUS_SET: LazyLock<HashSet<TaskStatus>> = LazyLock::new(|| {
     .into_iter()
     .collect()
 });
-
-type CompactionRequestChannelItem = (CompactionGroupId, compact_task::TaskType);
 
 fn init_selectors() -> HashMap<compact_task::TaskType, Box<dyn CompactionSelector>> {
     let mut compaction_selectors: HashMap<compact_task::TaskType, Box<dyn CompactionSelector>> =
@@ -251,7 +236,7 @@ impl HummockManager {
     pub fn compaction_event_loop(
         hummock_manager: Arc<Self>,
         compactor_streams_change_rx: UnboundedReceiver<(
-            u32,
+            HummockContextId,
             Streaming<SubscribeCompactionEventRequest>,
         )>,
     ) -> Vec<(JoinHandle<()>, Sender<()>)> {
@@ -288,48 +273,12 @@ impl HummockManager {
 
     pub fn add_compactor_stream(
         &self,
-        context_id: u32,
+        context_id: HummockContextId,
         req_stream: Streaming<SubscribeCompactionEventRequest>,
     ) {
         self.compactor_streams_change_tx
             .send((context_id, req_stream))
             .unwrap();
-    }
-
-    pub async fn auto_pick_compaction_group_and_type(
-        &self,
-    ) -> Option<(CompactionGroupId, compact_task::TaskType)> {
-        let mut compaction_group_ids = self.compaction_group_ids().await;
-        compaction_group_ids.shuffle(&mut thread_rng());
-
-        for cg_id in compaction_group_ids {
-            if let Some(pick_type) = self.compaction_state.auto_pick_type(cg_id) {
-                return Some((cg_id, pick_type));
-            }
-        }
-
-        None
-    }
-
-    /// This method will return all compaction group id in a random order and task type. If there are any group block by `write_limit`, it will return a single array with `TaskType::Emergency`.
-    /// If these groups get different task-type, it will return all group id with `TaskType::Dynamic` if the first group get `TaskType::Dynamic`, otherwise it will return the single group with other task type.
-    async fn auto_pick_compaction_groups_and_type(
-        &self,
-    ) -> (Vec<CompactionGroupId>, compact_task::TaskType) {
-        let mut compaction_group_ids = self.compaction_group_ids().await;
-        compaction_group_ids.shuffle(&mut thread_rng());
-
-        let mut normal_groups = vec![];
-        for cg_id in compaction_group_ids {
-            if let Some(pick_type) = self.compaction_state.auto_pick_type(cg_id) {
-                if pick_type == TaskType::Dynamic {
-                    normal_groups.push(cg_id);
-                } else if normal_groups.is_empty() {
-                    return (vec![cg_id], pick_type);
-                }
-            }
-        }
-        (normal_groups, TaskType::Dynamic)
     }
 }
 
@@ -435,10 +384,10 @@ impl HummockManager {
                 .state_table_info
                 .compaction_group_member_table_ids(compaction_group_id)
                 .iter()
-                .map(|table_id| table_id.table_id)
+                .copied()
                 .collect();
 
-            let mut table_id_to_option: HashMap<u32, _> = HashMap::default();
+            let mut table_id_to_option: HashMap<TableId, _> = HashMap::default();
 
             {
                 let guard = self.table_id_to_table_option.read();
@@ -508,6 +457,7 @@ impl HummockManager {
                     task_type: compact_task.compaction_task_type,
                     split_weight_by_vnode: vnode_partition_count,
                     max_sub_compaction: group_config.compaction_config.max_sub_compaction,
+                    max_kv_count_for_xor16: group_config.compaction_config.max_kv_count_for_xor16,
                     ..Default::default()
                 };
 
@@ -562,30 +512,42 @@ impl HummockManager {
                     self.calculate_vnode_partition(
                         &mut compact_task,
                         group_config.compaction_config.as_ref(),
-                    );
+                        version
+                            .latest_version()
+                            .get_compaction_group_levels(compaction_group_id),
+                    )
+                    .await?;
 
                     let table_ids_to_be_compacted = compact_task.build_compact_table_ids();
 
-                    let (pk_prefix_table_watermarks, non_pk_prefix_table_watermarks) = version
+                    let mut pk_prefix_table_watermarks = BTreeMap::default();
+                    let mut non_pk_prefix_table_watermarks = BTreeMap::default();
+                    let mut value_table_watermarks = BTreeMap::default();
+                    for (table_id, watermark) in version
                         .latest_version()
                         .safe_epoch_table_watermarks(&table_ids_to_be_compacted)
-                        .into_iter()
-                        .partition(|(_table_id, table_watermarke)| {
-                            matches!(
-                                table_watermarke.watermark_type,
-                                WatermarkSerdeType::PkPrefix
-                            )
-                        });
-
+                    {
+                        match watermark.watermark_type {
+                            WatermarkSerdeType::PkPrefix => {
+                                pk_prefix_table_watermarks.insert(table_id, watermark);
+                            }
+                            WatermarkSerdeType::NonPkPrefix => {
+                                non_pk_prefix_table_watermarks.insert(table_id, watermark);
+                            }
+                            WatermarkSerdeType::Value => {
+                                value_table_watermarks.insert(table_id, watermark);
+                            }
+                        }
+                    }
                     compact_task.pk_prefix_table_watermarks = pk_prefix_table_watermarks;
                     compact_task.non_pk_prefix_table_watermarks = non_pk_prefix_table_watermarks;
+                    compact_task.value_table_watermarks = value_table_watermarks;
 
                     compact_task.table_schemas = compact_task
                         .existing_table_ids
                         .iter()
                         .filter_map(|table_id| {
-                            let id = (*table_id).try_into().unwrap();
-                            all_versioned_table_schemas.get(&id).map(|column_ids| {
+                            all_versioned_table_schemas.get(table_id).map(|column_ids| {
                                 (
                                     *table_id,
                                     TableSchema {
@@ -967,8 +929,11 @@ impl HummockManager {
             if is_success {
                 success_count += 1;
                 version.apply_compact_task(&compact_task);
-                if purge_prost_table_stats(&mut version_stats.table_stats, version.latest_version())
-                {
+                if purge_prost_table_stats(
+                    &mut version_stats.table_stats,
+                    version.latest_version(),
+                    &HashSet::default(),
+                ) {
                     self.metrics.version_stats.reset();
                     versioning.local_metrics.clear();
                 }
@@ -1135,107 +1100,187 @@ impl HummockManager {
         Ok(())
     }
 
-    /// Sends a compaction request.
+    /// Sends a compaction request for new data (clears cooldown).
     pub fn try_send_compaction_request(
         &self,
         compaction_group: CompactionGroupId,
         task_type: compact_task::TaskType,
     ) -> bool {
-        match self
-            .compaction_state
-            .try_sched_compaction(compaction_group, task_type)
-        {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::error!(
-                    error = %e.as_report(),
-                    "failed to send compaction request for compaction group {}",
-                    compaction_group,
-                );
-                false
-            }
-        }
+        self.compaction_state.try_sched_compaction(
+            compaction_group,
+            task_type,
+            ScheduleTrigger::NewData,
+        )
     }
 
-    pub(crate) fn calculate_vnode_partition(
+    /// Apply vnode-aligned compaction for large single-table levels.
+    /// This enables one-vnode-per-SST alignment for precise query pruning.
+    async fn try_apply_vnode_aligned_partition(
+        &self,
+        compact_task: &mut CompactTask,
+        compaction_config: &CompactionConfig,
+        levels: &Levels,
+    ) -> Result<bool> {
+        // Check if vnode-aligned compaction is enabled for this level
+        // Only enable for single-table scenarios to avoid cross-table complexity
+        let Some(threshold) = compaction_config.vnode_aligned_level_size_threshold else {
+            return Ok(false);
+        };
+
+        if compact_task.target_level < compact_task.base_level
+            || compact_task.existing_table_ids.len() != 1
+        {
+            return Ok(false);
+        }
+
+        // Calculate total size of the entire target level
+        let target_level_size = levels
+            .get_level(compact_task.target_level as usize)
+            .total_file_size;
+
+        if target_level_size < threshold {
+            return Ok(false);
+        }
+
+        // Enable strict one-vnode-per-SST alignment for single table
+        let table_id = compact_task.existing_table_ids[0];
+
+        // Get the actual vnode count from table catalog
+        let table = self
+            .metadata_manager
+            .get_table_catalog_by_ids(&[table_id])
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to get table catalog for table_id {} in compaction_group {}",
+                    table_id, compact_task.compaction_group_id
+                )
+            })
+            .map_err(Error::Internal)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                Error::Internal(anyhow::anyhow!(
+                    "Table catalog not found for table_id {} in compaction_group {}",
+                    table_id,
+                    compact_task.compaction_group_id
+                ))
+            })?;
+
+        compact_task
+            .table_vnode_partition
+            .insert(table_id, table.vnode_count() as u32);
+
+        Ok(true)
+    }
+
+    /// Apply `split_weight_by_vnode` based partition strategy.
+    /// This handles dynamic partitioning based on table size and write throughput.
+    fn apply_split_weight_by_vnode_partition(
         &self,
         compact_task: &mut CompactTask,
         compaction_config: &CompactionConfig,
     ) {
-        // do not split sst by vnode partition when target_level > base_level
-        // The purpose of data alignment is mainly to improve the parallelism of base level compaction and reduce write amplification.
-        // However, at high level, the size of the sst file is often larger and only contains the data of a single table_id, so there is no need to cut it.
-        if compact_task.target_level > compact_task.base_level {
-            return;
-        }
         if compaction_config.split_weight_by_vnode > 0 {
             for table_id in &compact_task.existing_table_ids {
                 compact_task
                     .table_vnode_partition
                     .insert(*table_id, compact_task.split_weight_by_vnode);
             }
-        } else {
-            let mut table_size_info: HashMap<u32, u64> = HashMap::default();
-            let mut existing_table_ids: HashSet<u32> = HashSet::default();
-            for input_ssts in &compact_task.input_ssts {
-                for sst in &input_ssts.table_infos {
-                    existing_table_ids.extend(sst.table_ids.iter());
-                    for table_id in &sst.table_ids {
-                        *table_size_info.entry(*table_id).or_default() +=
-                            sst.sst_size / (sst.table_ids.len() as u64);
-                    }
-                }
-            }
-            compact_task
-                .existing_table_ids
-                .retain(|table_id| existing_table_ids.contains(table_id));
 
-            let hybrid_vnode_count = self.env.opts.hybrid_partition_node_count;
-            let default_partition_count = self.env.opts.partition_vnode_count;
-            // We must ensure the partition threshold large enough to avoid too many small files.
-            let compact_task_table_size_partition_threshold_low = self
-                .env
-                .opts
-                .compact_task_table_size_partition_threshold_low;
-            let compact_task_table_size_partition_threshold_high = self
-                .env
-                .opts
-                .compact_task_table_size_partition_threshold_high;
-            // check latest write throughput
-            let table_write_throughput_statistic_manager =
-                self.table_write_throughput_statistic_manager.read();
-            let timestamp = chrono::Utc::now().timestamp();
-            for (table_id, compact_table_size) in table_size_info {
-                let write_throughput = table_write_throughput_statistic_manager
-                    .get_table_throughput_descending(table_id, timestamp)
-                    .peekable()
-                    .peek()
-                    .map(|item| item.throughput)
-                    .unwrap_or(0);
-                if compact_table_size > compact_task_table_size_partition_threshold_high
-                    && default_partition_count > 0
-                {
-                    compact_task
-                        .table_vnode_partition
-                        .insert(table_id, default_partition_count);
-                } else if (compact_table_size > compact_task_table_size_partition_threshold_low
-                    || (write_throughput > self.env.opts.table_high_write_throughput_threshold
-                        && compact_table_size > compaction_config.target_file_size_base))
-                    && hybrid_vnode_count > 0
-                {
-                    // partition for large write throughput table. But we also need to make sure that it can not be too small.
-                    compact_task
-                        .table_vnode_partition
-                        .insert(table_id, hybrid_vnode_count);
-                } else if compact_table_size > compaction_config.target_file_size_base {
-                    // partition for small table
-                    compact_task.table_vnode_partition.insert(table_id, 1);
+            return;
+        }
+
+        // Calculate per-table size from input SSTs
+        let mut table_size_info: HashMap<TableId, u64> = HashMap::default();
+        let mut existing_table_ids: HashSet<TableId> = HashSet::default();
+        for input_ssts in &compact_task.input_ssts {
+            for sst in &input_ssts.table_infos {
+                existing_table_ids.extend(sst.table_ids.iter());
+                for table_id in &sst.table_ids {
+                    *table_size_info.entry(*table_id).or_default() +=
+                        sst.sst_size / (sst.table_ids.len() as u64);
                 }
             }
-            compact_task
-                .table_vnode_partition
-                .retain(|table_id, _| compact_task.existing_table_ids.contains(table_id));
         }
+        compact_task
+            .existing_table_ids
+            .retain(|table_id| existing_table_ids.contains(table_id));
+
+        let hybrid_vnode_count = self.env.opts.hybrid_partition_node_count;
+        let default_partition_count = self.env.opts.partition_vnode_count;
+        let compact_task_table_size_partition_threshold_low = self
+            .env
+            .opts
+            .compact_task_table_size_partition_threshold_low;
+        let compact_task_table_size_partition_threshold_high = self
+            .env
+            .opts
+            .compact_task_table_size_partition_threshold_high;
+
+        // Check latest write throughput
+        let table_write_throughput_statistic_manager =
+            self.table_write_throughput_statistic_manager.read();
+        let timestamp = chrono::Utc::now().timestamp();
+
+        for (table_id, compact_table_size) in table_size_info {
+            let write_throughput = table_write_throughput_statistic_manager
+                .get_table_throughput_descending(table_id, timestamp)
+                .peekable()
+                .peek()
+                .map(|item| item.throughput)
+                .unwrap_or(0);
+
+            if compact_table_size > compact_task_table_size_partition_threshold_high
+                && default_partition_count > 0
+            {
+                compact_task
+                    .table_vnode_partition
+                    .insert(table_id, default_partition_count);
+            } else if (compact_table_size > compact_task_table_size_partition_threshold_low
+                || (write_throughput > self.env.opts.table_high_write_throughput_threshold
+                    && compact_table_size > compaction_config.target_file_size_base))
+                && hybrid_vnode_count > 0
+            {
+                compact_task
+                    .table_vnode_partition
+                    .insert(table_id, hybrid_vnode_count);
+            } else if compact_table_size > compaction_config.target_file_size_base {
+                compact_task.table_vnode_partition.insert(table_id, 1);
+            }
+        }
+
+        compact_task
+            .table_vnode_partition
+            .retain(|table_id, _| compact_task.existing_table_ids.contains(table_id));
+    }
+
+    pub(crate) async fn calculate_vnode_partition(
+        &self,
+        compact_task: &mut CompactTask,
+        compaction_config: &CompactionConfig,
+        levels: &Levels,
+    ) -> Result<()> {
+        // Try vnode-aligned partition first (for large single-table levels)
+        if self
+            .try_apply_vnode_aligned_partition(compact_task, compaction_config, levels)
+            .await?
+        {
+            return Ok(());
+        }
+
+        // Do not split sst by vnode partition when target_level > base_level
+        // The purpose of data alignment is mainly to improve the parallelism of base level compaction
+        // and reduce write amplification. However, at high level, the size of the sst file is often
+        // larger and only contains the data of a single table_id, so there is no need to cut it.
+        if compact_task.target_level > compact_task.base_level {
+            return Ok(());
+        }
+
+        // Apply split_weight_by_vnode based partition strategy
+        self.apply_split_weight_by_vnode_partition(compact_task, compaction_config);
+
+        Ok(())
     }
 
     pub fn compactor_manager_ref(&self) -> crate::hummock::CompactorManagerRef {
@@ -1268,7 +1313,7 @@ impl HummockManager {
                 task_id,
                 CompactTaskAssignment {
                     compact_task: Some(task.into()),
-                    context_id: 0,
+                    context_id: 0.into(),
                 },
             );
         }
@@ -1287,56 +1332,168 @@ impl HummockManager {
     }
 }
 
+/// What triggered the compaction schedule request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleTrigger {
+    /// New data arrived (e.g., `commit_epoch`). Clears cooldown.
+    NewData,
+    /// Periodic timer. Respects cooldown for Dynamic type.
+    Periodic,
+}
+
+/// A point-in-time snapshot of the compaction schedule state.
+///
+/// `snapshot_time` is used by `unschedule()` to detect whether new data arrived
+/// after the snapshot was taken, preventing incorrect cooldown.
+pub struct CompactionScheduleSnapshot {
+    scheduled: HashSet<(CompactionGroupId, compact_task::TaskType)>,
+    snapshot_time: Instant,
+}
+
+impl CompactionScheduleSnapshot {
+    /// Task type priority order for scheduling (checked first = higher priority).
+    const TASK_TYPE_PRIORITY: &[TaskType] = &[
+        TaskType::Dynamic,
+        TaskType::SpaceReclaim,
+        TaskType::Ttl,
+        TaskType::Tombstone,
+        TaskType::VnodeWatermark,
+    ];
+
+    pub fn snapshot_time(&self) -> Instant {
+        self.snapshot_time
+    }
+
+    /// Pick compaction groups and task type from this snapshot.
+    ///
+    /// Returns groups in shuffled order. Non-Dynamic types have higher priority
+    /// and return a single group; Dynamic groups are batched together.
+    pub fn pick_compaction_groups_and_type(&self) -> Option<(Vec<CompactionGroupId>, TaskType)> {
+        let group_ids = self.group_ids_shuffled();
+        let mut normal_groups = vec![];
+        for cg_id in group_ids {
+            if let Some(pick_type) = self.pick_type(cg_id) {
+                if pick_type == TaskType::Dynamic {
+                    normal_groups.push(cg_id);
+                } else if normal_groups.is_empty() {
+                    return Some((vec![cg_id], pick_type));
+                }
+            }
+        }
+        if normal_groups.is_empty() {
+            None
+        } else {
+            Some((normal_groups, TaskType::Dynamic))
+        }
+    }
+
+    fn group_ids_shuffled(&self) -> Vec<CompactionGroupId> {
+        let mut group_ids: Vec<_> = self.scheduled.iter().map(|(g, _)| *g).unique().collect();
+        group_ids.shuffle(&mut thread_rng());
+        group_ids
+    }
+
+    fn pick_type(&self, group: CompactionGroupId) -> Option<TaskType> {
+        Self::TASK_TYPE_PRIORITY
+            .iter()
+            .find(|t| self.scheduled.contains(&(group, **t)))
+            .copied()
+    }
+}
+
+/// Tracks which (`compaction_group`, `task_type`) pairs are scheduled for compaction.
+///
+/// For `Dynamic` type, includes a cooldown mechanism: groups with no compaction work
+/// are skipped by periodic triggers until new data arrives via `commit_epoch`.
 #[derive(Debug, Default)]
 pub struct CompactionState {
-    scheduled: Mutex<HashSet<(CompactionGroupId, compact_task::TaskType)>>,
+    inner: Mutex<CompactionStateInner>,
+}
+
+#[derive(Debug, Default)]
+struct CompactionStateInner {
+    scheduled: HashSet<(CompactionGroupId, compact_task::TaskType)>,
+    /// Groups skipped by periodic Dynamic trigger until new data arrives.
+    dynamic_cooldown: HashSet<CompactionGroupId>,
+    /// Tracks new-data arrival time per group for cooldown race detection.
+    last_new_data_time: HashMap<CompactionGroupId, Instant>,
 }
 
 impl CompactionState {
     pub fn new() -> Self {
         Self {
-            scheduled: Default::default(),
+            inner: Default::default(),
         }
     }
 
-    /// Enqueues only if the target is not yet in queue.
+    /// Enqueues a compaction request. Returns `true` if newly scheduled.
+    ///
+    /// `trigger` only affects `Dynamic` type — see [`ScheduleTrigger`].
     pub fn try_sched_compaction(
         &self,
         compaction_group: CompactionGroupId,
         task_type: TaskType,
-    ) -> std::result::Result<bool, SendError<CompactionRequestChannelItem>> {
-        let mut guard = self.scheduled.lock();
-        let key = (compaction_group, task_type);
-        if guard.contains(&key) {
-            return Ok(false);
+        trigger: ScheduleTrigger,
+    ) -> bool {
+        let mut guard = self.inner.lock();
+        if task_type == TaskType::Dynamic {
+            match trigger {
+                ScheduleTrigger::NewData => {
+                    guard.dynamic_cooldown.remove(&compaction_group);
+                    guard
+                        .last_new_data_time
+                        .insert(compaction_group, Instant::now());
+                }
+                ScheduleTrigger::Periodic => {
+                    if guard.dynamic_cooldown.contains(&compaction_group) {
+                        return false;
+                    }
+                }
+            }
         }
-        guard.insert(key);
-        Ok(true)
+        guard.scheduled.insert((compaction_group, task_type))
     }
 
+    /// Removes a scheduled entry. For Dynamic type, adds to cooldown unless
+    /// new data arrived after `snapshot_time`.
     pub fn unschedule(
         &self,
         compaction_group: CompactionGroupId,
         task_type: compact_task::TaskType,
+        snapshot_time: Instant,
     ) {
-        self.scheduled.lock().remove(&(compaction_group, task_type));
+        let mut guard = self.inner.lock();
+        guard.scheduled.remove(&(compaction_group, task_type));
+        if task_type == TaskType::Dynamic {
+            let has_new_data = guard
+                .last_new_data_time
+                .get(&compaction_group)
+                .is_some_and(|t| *t > snapshot_time);
+            if !has_new_data {
+                guard.dynamic_cooldown.insert(compaction_group);
+            }
+        }
     }
 
-    pub fn auto_pick_type(&self, group: CompactionGroupId) -> Option<TaskType> {
-        let guard = self.scheduled.lock();
-        if guard.contains(&(group, compact_task::TaskType::Dynamic)) {
-            Some(compact_task::TaskType::Dynamic)
-        } else if guard.contains(&(group, compact_task::TaskType::SpaceReclaim)) {
-            Some(compact_task::TaskType::SpaceReclaim)
-        } else if guard.contains(&(group, compact_task::TaskType::Ttl)) {
-            Some(compact_task::TaskType::Ttl)
-        } else if guard.contains(&(group, compact_task::TaskType::Tombstone)) {
-            Some(compact_task::TaskType::Tombstone)
-        } else if guard.contains(&(group, compact_task::TaskType::VnodeWatermark)) {
-            Some(compact_task::TaskType::VnodeWatermark)
-        } else {
-            None
+    /// Takes a snapshot of the current schedule state.
+    pub fn snapshot(&self) -> CompactionScheduleSnapshot {
+        let guard = self.inner.lock();
+        // Record time after lock to ensure accurate ordering vs. try_sched_compaction
+        let snapshot_time = Instant::now();
+        CompactionScheduleSnapshot {
+            scheduled: guard.scheduled.clone(),
+            snapshot_time,
         }
+    }
+
+    /// Removes all schedule state for a deleted or merged group.
+    pub fn remove_compaction_group(&self, compaction_group: CompactionGroupId) {
+        let mut guard = self.inner.lock();
+        guard
+            .scheduled
+            .retain(|(group, _)| *group != compaction_group);
+        guard.dynamic_cooldown.remove(&compaction_group);
+        guard.last_new_data_time.remove(&compaction_group);
     }
 }
 
@@ -1381,7 +1538,7 @@ fn update_table_stats_for_vnode_watermark_trivial_reclaim(
     if task.task_type != TaskType::VnodeWatermark {
         return;
     }
-    let mut deleted_table_keys: HashMap<u32, u64> = HashMap::default();
+    let mut deleted_table_keys: HashMap<TableId, u64> = HashMap::default();
     for s in task.input_ssts.iter().flat_map(|l| l.table_infos.iter()) {
         assert_eq!(s.table_ids.len(), 1);
         let e = deleted_table_keys.entry(s.table_ids[0]).or_insert(0);
@@ -1593,5 +1750,267 @@ impl GroupStateValidator {
         }
 
         Self::check_single_group_emergency(levels, compaction_config)
+    }
+}
+
+#[cfg(test)]
+mod compaction_state_tests {
+    use risingwave_pb::hummock::compact_task::TaskType;
+
+    use super::*;
+
+    #[test]
+    fn test_basic_schedule_and_unschedule() {
+        let state = CompactionState::new();
+        let group_id: CompactionGroupId = 1.into();
+
+        // First schedule should succeed
+        assert!(state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData));
+        // Duplicate schedule should fail
+        assert!(!state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData));
+        // Different task type should succeed
+        assert!(state.try_sched_compaction(group_id, TaskType::Ttl, ScheduleTrigger::Periodic));
+
+        // Snapshot should contain both
+        let snapshot = state.snapshot();
+        assert!(snapshot.scheduled.contains(&(group_id, TaskType::Dynamic)));
+        assert!(snapshot.scheduled.contains(&(group_id, TaskType::Ttl)));
+
+        // Unschedule removes from scheduled set
+        state.unschedule(group_id, TaskType::Dynamic, snapshot.snapshot_time());
+        let snapshot2 = state.snapshot();
+        assert!(!snapshot2.scheduled.contains(&(group_id, TaskType::Dynamic)));
+        assert!(snapshot2.scheduled.contains(&(group_id, TaskType::Ttl)));
+    }
+
+    #[test]
+    fn test_cooldown_blocks_periodic_trigger() {
+        let state = CompactionState::new();
+        let group_id: CompactionGroupId = 1.into();
+
+        // Schedule then unschedule - should add to cooldown
+        assert!(state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData));
+        let snapshot = state.snapshot();
+        state.unschedule(group_id, TaskType::Dynamic, snapshot.snapshot_time());
+
+        // Verify in cooldown
+        assert!(state.inner.lock().dynamic_cooldown.contains(&group_id));
+
+        // Periodic trigger should be blocked
+        assert!(!state.try_sched_compaction(
+            group_id,
+            TaskType::Dynamic,
+            ScheduleTrigger::Periodic
+        ));
+    }
+
+    #[test]
+    fn test_new_data_clears_cooldown() {
+        let state = CompactionState::new();
+        let group_id: CompactionGroupId = 1.into();
+
+        // Put group in cooldown
+        assert!(state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData));
+        let snapshot = state.snapshot();
+        state.unschedule(group_id, TaskType::Dynamic, snapshot.snapshot_time());
+        assert!(state.inner.lock().dynamic_cooldown.contains(&group_id));
+
+        // NewData trigger should clear cooldown and schedule
+        assert!(state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData));
+        assert!(!state.inner.lock().dynamic_cooldown.contains(&group_id));
+    }
+
+    #[test]
+    fn test_cooldown_only_affects_dynamic_type() {
+        let state = CompactionState::new();
+        let group_id: CompactionGroupId = 1.into();
+
+        // Put group in cooldown for Dynamic
+        assert!(state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData));
+        let snapshot = state.snapshot();
+        state.unschedule(group_id, TaskType::Dynamic, snapshot.snapshot_time());
+
+        // Ttl unschedule should NOT add to cooldown
+        let group_id_2: CompactionGroupId = 2.into();
+        assert!(state.try_sched_compaction(group_id_2, TaskType::Ttl, ScheduleTrigger::Periodic));
+        let snapshot2 = state.snapshot();
+        state.unschedule(group_id_2, TaskType::Ttl, snapshot2.snapshot_time());
+        assert!(!state.inner.lock().dynamic_cooldown.contains(&group_id_2));
+
+        // Other task types should work regardless of cooldown
+        assert!(state.try_sched_compaction(group_id, TaskType::Ttl, ScheduleTrigger::Periodic));
+        assert!(state.try_sched_compaction(
+            group_id,
+            TaskType::SpaceReclaim,
+            ScheduleTrigger::Periodic
+        ));
+    }
+
+    #[test]
+    fn test_race_condition_new_data_after_snapshot() {
+        let state = CompactionState::new();
+        let group_id: CompactionGroupId = 1.into();
+
+        assert!(state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData));
+        let snapshot = state.snapshot();
+
+        // Simulate new data arriving AFTER snapshot
+        {
+            let mut guard = state.inner.lock();
+            guard.last_new_data_time.insert(group_id, Instant::now());
+        }
+
+        // Unschedule should NOT add to cooldown (new data arrived after snapshot)
+        state.unschedule(group_id, TaskType::Dynamic, snapshot.snapshot_time());
+        assert!(
+            !state.inner.lock().dynamic_cooldown.contains(&group_id),
+            "Should skip cooldown when new data arrived after snapshot"
+        );
+    }
+
+    #[test]
+    fn test_remove_compaction_group_cleans_all_state() {
+        let state = CompactionState::new();
+        let group_id: CompactionGroupId = 1.into();
+
+        // Set up state
+        assert!(state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData));
+        assert!(state.try_sched_compaction(group_id, TaskType::Ttl, ScheduleTrigger::Periodic));
+        state.inner.lock().dynamic_cooldown.insert(group_id);
+
+        // Remove group
+        state.remove_compaction_group(group_id);
+
+        // Verify all state cleaned up
+        let guard = state.inner.lock();
+        assert!(!guard.scheduled.contains(&(group_id, TaskType::Dynamic)));
+        assert!(!guard.scheduled.contains(&(group_id, TaskType::Ttl)));
+        assert!(!guard.dynamic_cooldown.contains(&group_id));
+        assert!(!guard.last_new_data_time.contains_key(&group_id));
+    }
+
+    #[test]
+    fn test_snapshot_pick_type_priority() {
+        let state = CompactionState::new();
+        let group_id: CompactionGroupId = 1.into();
+
+        // Empty group returns None
+        assert_eq!(state.snapshot().pick_type(group_id), None);
+
+        // Priority order: Dynamic > SpaceReclaim > Ttl > Tombstone > VnodeWatermark
+        state.try_sched_compaction(
+            group_id,
+            TaskType::VnodeWatermark,
+            ScheduleTrigger::Periodic,
+        );
+        assert_eq!(
+            state.snapshot().pick_type(group_id),
+            Some(TaskType::VnodeWatermark)
+        );
+
+        state.try_sched_compaction(group_id, TaskType::Tombstone, ScheduleTrigger::Periodic);
+        assert_eq!(
+            state.snapshot().pick_type(group_id),
+            Some(TaskType::Tombstone)
+        );
+
+        state.try_sched_compaction(group_id, TaskType::Ttl, ScheduleTrigger::Periodic);
+        assert_eq!(state.snapshot().pick_type(group_id), Some(TaskType::Ttl));
+
+        state.try_sched_compaction(group_id, TaskType::SpaceReclaim, ScheduleTrigger::Periodic);
+        assert_eq!(
+            state.snapshot().pick_type(group_id),
+            Some(TaskType::SpaceReclaim)
+        );
+
+        state.try_sched_compaction(group_id, TaskType::Dynamic, ScheduleTrigger::NewData);
+        assert_eq!(
+            state.snapshot().pick_type(group_id),
+            Some(TaskType::Dynamic)
+        );
+    }
+
+    #[test]
+    fn test_multiple_groups_independent_cooldown() {
+        let state = CompactionState::new();
+        let g1: CompactionGroupId = 1.into();
+        let g2: CompactionGroupId = 2.into();
+
+        state.try_sched_compaction(g1, TaskType::Dynamic, ScheduleTrigger::NewData);
+        state.try_sched_compaction(g2, TaskType::Dynamic, ScheduleTrigger::NewData);
+        let snapshot = state.snapshot();
+
+        // Only unschedule g1
+        state.unschedule(g1, TaskType::Dynamic, snapshot.snapshot_time());
+
+        let guard = state.inner.lock();
+        assert!(guard.dynamic_cooldown.contains(&g1));
+        assert!(!guard.dynamic_cooldown.contains(&g2));
+    }
+
+    #[test]
+    fn test_pick_compaction_groups_empty() {
+        let state = CompactionState::new();
+        let snapshot = state.snapshot();
+        // No scheduled groups → returns None
+        assert!(snapshot.pick_compaction_groups_and_type().is_none());
+    }
+
+    #[test]
+    fn test_pick_compaction_groups_mixed_types() {
+        let state = CompactionState::new();
+        let g1: CompactionGroupId = 1.into();
+        let g2: CompactionGroupId = 2.into();
+        let g3: CompactionGroupId = 3.into();
+
+        // g1: Dynamic, g2: Ttl, g3: Dynamic
+        state.try_sched_compaction(g1, TaskType::Dynamic, ScheduleTrigger::NewData);
+        state.try_sched_compaction(g2, TaskType::Ttl, ScheduleTrigger::Periodic);
+        state.try_sched_compaction(g3, TaskType::Dynamic, ScheduleTrigger::NewData);
+
+        let snapshot = state.snapshot();
+        let (groups, task_type) = snapshot.pick_compaction_groups_and_type().unwrap();
+
+        // Due to shuffle, either:
+        // - Ttl group is encountered first → returns (vec![g2], Ttl)
+        // - Dynamic group is encountered first → collects all Dynamic, skips Ttl
+        //   → returns ([g1, g3] in some order, Dynamic)
+        if task_type == TaskType::Dynamic {
+            assert!(groups.contains(&g1));
+            assert!(groups.contains(&g3));
+            assert!(!groups.contains(&g2)); // Ttl group excluded from Dynamic result
+        } else {
+            assert_eq!(task_type, TaskType::Ttl);
+            assert_eq!(groups, vec![g2]);
+        }
+    }
+
+    #[test]
+    fn test_pick_compaction_groups_all_dynamic() {
+        let state = CompactionState::new();
+        let g1: CompactionGroupId = 1.into();
+        let g2: CompactionGroupId = 2.into();
+
+        state.try_sched_compaction(g1, TaskType::Dynamic, ScheduleTrigger::NewData);
+        state.try_sched_compaction(g2, TaskType::Dynamic, ScheduleTrigger::NewData);
+
+        let snapshot = state.snapshot();
+        let (groups, task_type) = snapshot.pick_compaction_groups_and_type().unwrap();
+        assert_eq!(task_type, TaskType::Dynamic);
+        assert!(groups.contains(&g1));
+        assert!(groups.contains(&g2));
+    }
+
+    #[test]
+    fn test_pick_compaction_groups_single_non_dynamic() {
+        let state = CompactionState::new();
+        let g1: CompactionGroupId = 1.into();
+
+        state.try_sched_compaction(g1, TaskType::SpaceReclaim, ScheduleTrigger::Periodic);
+
+        let snapshot = state.snapshot();
+        let (groups, task_type) = snapshot.pick_compaction_groups_and_type().unwrap();
+        assert_eq!(task_type, TaskType::SpaceReclaim);
+        assert_eq!(groups, vec![g1]);
     }
 }

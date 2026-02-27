@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_sqlparser::ast::AsOf;
 
 use super::batch::prelude::*;
-use super::utils::{Distill, childless_record, scan_ranges_as_strs, to_pb_time_travel_as_of};
+use super::utils::{Distill, childless_record, scan_ranges_as_strs, to_batch_query_epoch};
 use super::{BatchPlanRef as PlanRef, ExprRewritable, PlanBase, ToDistributedBatch, generic};
 use crate::catalog::ColumnId;
 use crate::error::Result;
@@ -46,12 +46,29 @@ impl BatchSeqScan {
         scan_ranges: Vec<ScanRange>,
         limit: Option<u64>,
     ) -> Self {
-        let order = if scan_ranges.len() > 1 {
-            Order::any()
+        let orders = if scan_ranges.len() > 1 {
+            vec![Order::any()]
         } else {
-            core.get_out_column_index_order()
+            let base_order = core.get_out_column_index_order();
+            if scan_ranges.len() == 1 && !base_order.is_any() {
+                let eq_prefix_len = scan_ranges[0].eq_conds.len();
+                if eq_prefix_len > 0 {
+                    let mut orders = vec![base_order.clone()];
+                    let max_trim = eq_prefix_len.min(base_order.column_orders.len());
+                    for trim in 1..=max_trim {
+                        orders.push(Order {
+                            column_orders: base_order.column_orders[trim..].to_vec(),
+                        });
+                    }
+                    orders
+                } else {
+                    vec![base_order]
+                }
+            } else {
+                vec![base_order]
+            }
         };
-        let base = PlanBase::new_batch_with_core(&core, dist, order);
+        let base = PlanBase::new_batch_with_core_and_orders(&core, dist, orders);
 
         {
             // validate scan_range
@@ -194,7 +211,7 @@ impl TryToBatchPb for BatchSeqScan {
             vnode_bitmap: None,
             ordered: !self.order().is_any(),
             limit: *self.limit(),
-            as_of: to_pb_time_travel_as_of(&self.as_of)?,
+            query_epoch: to_batch_query_epoch(&self.as_of)?,
         }))
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
@@ -20,7 +21,9 @@ use await_tree::InstrumentAwait;
 use parking_lot::{Mutex, MutexGuard};
 use risingwave_common::array::StreamChunk;
 use risingwave_common::bitmap::Bitmap;
+use risingwave_common_estimate_size::EstimateSize;
 use risingwave_connector::sink::log_store::{ChunkId, LogStoreResult, TruncateOffset};
+use risingwave_pb::stream_plan::PbSinkSchemaChange;
 use tokio::sync::Notify;
 
 use crate::common::log_store_impl::kv_log_store::{
@@ -47,7 +50,23 @@ pub(crate) enum LogStoreBufferItem {
     Barrier {
         is_checkpoint: bool,
         next_epoch: u64,
+        schema_change: Option<PbSinkSchemaChange>,
+        is_stop: bool,
     },
+}
+
+impl EstimateSize for LogStoreBufferItem {
+    fn estimated_heap_size(&self) -> usize {
+        match self {
+            LogStoreBufferItem::StreamChunk { chunk, .. } => chunk.estimated_heap_size(),
+            LogStoreBufferItem::Flushed { vnode_bitmap, .. } => vnode_bitmap.estimated_heap_size(),
+            LogStoreBufferItem::Barrier { .. } => 0,
+        }
+    }
+
+    fn estimated_size(&self) -> usize {
+        size_of::<Self>() + self.estimated_heap_size()
+    }
 }
 
 struct LogStoreBufferInner {
@@ -67,9 +86,10 @@ struct LogStoreBufferInner {
 }
 
 impl LogStoreBufferInner {
-    fn update_unconsumed_buffer_metrics(&self) {
+    fn update_buffer_metrics(&self) {
         let mut epoch_count = 0;
         let mut row_count = 0;
+        let mut memory_bytes = 0;
         for (_, item) in &self.unconsumed_queue {
             match item {
                 LogStoreBufferItem::StreamChunk { chunk, .. } => {
@@ -86,6 +106,10 @@ impl LogStoreBufferInner {
                     epoch_count += 1;
                 }
             }
+            memory_bytes += item.estimated_size();
+        }
+        for (_, item) in &self.consumed_queue {
+            memory_bytes += item.estimated_size();
         }
         self.metrics.buffer_unconsumed_epoch_count.set(epoch_count);
         self.metrics.buffer_unconsumed_row_count.set(row_count as _);
@@ -98,6 +122,7 @@ impl LogStoreBufferInner {
                 .map(|(epoch, _)| *epoch)
                 .unwrap_or_default() as _,
         );
+        self.metrics.buffer_memory_bytes.set(memory_bytes as _);
     }
 
     fn can_add_stream_chunk(&self) -> bool {
@@ -112,7 +137,7 @@ impl LogStoreBufferInner {
             self.next_chunk_id = 0;
         }
         self.unconsumed_queue.push_front((epoch, item));
-        self.update_unconsumed_buffer_metrics();
+        self.update_buffer_metrics();
     }
 
     pub(crate) fn try_add_stream_chunk(
@@ -138,7 +163,7 @@ impl LogStoreBufferInner {
                     chunk_id,
                 },
             ));
-            self.update_unconsumed_buffer_metrics();
+            self.update_buffer_metrics();
             None
         }
     }
@@ -146,7 +171,7 @@ impl LogStoreBufferInner {
     fn pop_item(&mut self) -> Option<(u64, LogStoreBufferItem)> {
         if let Some((epoch, item)) = self.unconsumed_queue.pop_back() {
             self.consumed_queue.push_front((epoch, item.clone()));
-            self.update_unconsumed_buffer_metrics();
+            self.update_buffer_metrics();
             Some((epoch, item))
         } else {
             None
@@ -198,7 +223,7 @@ impl LogStoreBufferInner {
                 },
             );
         }
-        self.update_unconsumed_buffer_metrics();
+        self.update_buffer_metrics();
     }
 
     fn add_truncate_offset(&mut self, (epoch, seq_id): ReaderTruncationOffsetType) {
@@ -218,7 +243,7 @@ impl LogStoreBufferInner {
                 self.unconsumed_queue.push_back((epoch, item));
             }
         }
-        self.update_unconsumed_buffer_metrics();
+        self.update_buffer_metrics();
     }
 
     fn clear(&mut self) {
@@ -256,6 +281,7 @@ impl<T> SharedMutex<T> {
 pub(crate) struct LogStoreBufferSender {
     buffer: SharedMutex<LogStoreBufferInner>,
     update_notify: Arc<Notify>,
+    truncate_notify: Arc<Notify>,
 }
 
 impl LogStoreBufferSender {
@@ -290,12 +316,21 @@ impl LogStoreBufferSender {
         ret
     }
 
-    pub(crate) fn barrier(&self, epoch: u64, is_checkpoint: bool, next_epoch: u64) {
+    pub(crate) fn barrier(
+        &self,
+        epoch: u64,
+        is_checkpoint: bool,
+        next_epoch: u64,
+        schema_change: Option<PbSinkSchemaChange>,
+        is_stop: bool,
+    ) {
         self.buffer.inner().add_item(
             epoch,
             LogStoreBufferItem::Barrier {
                 is_checkpoint,
                 next_epoch,
+                schema_change,
+                is_stop,
             },
         );
         self.update_notify.notify_waiters();
@@ -310,6 +345,36 @@ impl LogStoreBufferSender {
             ret = inner.truncation_list.pop_front();
         }
         ret
+    }
+
+    pub(crate) async fn wait_for_barrier_truncation(
+        &self,
+        curr_epoch: u64,
+    ) -> LogStoreResult<ReaderTruncationOffsetType> {
+        loop {
+            let notified = self.truncate_notify.notified();
+
+            {
+                let mut inner = self.buffer.inner();
+                while let Some((epoch, seq_id)) = inner.truncation_list.pop_front() {
+                    if epoch > curr_epoch {
+                        // TODO: should panic, after we confirm the correctness
+                        return Err(anyhow::anyhow!(
+                            "truncation epoch {} should not be larger than current epoch {}",
+                            epoch,
+                            curr_epoch
+                        ));
+                    }
+                    if epoch == curr_epoch && seq_id.is_none() {
+                        return Ok((epoch, seq_id));
+                    }
+                }
+            }
+
+            notified
+                .instrument_await("Wait For Barrier Truncation")
+                .await;
+        }
     }
 
     pub(crate) fn flush_all_unflushed(
@@ -351,6 +416,7 @@ impl LogStoreBufferSender {
 pub(crate) struct LogStoreBufferReceiver {
     buffer: SharedMutex<LogStoreBufferInner>,
     update_notify: Arc<Notify>,
+    truncate_notify: Arc<Notify>,
 }
 
 impl LogStoreBufferReceiver {
@@ -424,14 +490,17 @@ impl LogStoreBufferReceiver {
                 }
             }
         }
+        inner.update_buffer_metrics();
         if let Some(offset) = latest_offset {
             inner.add_truncate_offset(offset);
+            self.truncate_notify.notify_waiters();
         }
     }
 
     pub(crate) fn truncate_historical(&mut self, epoch: u64) {
         let mut inner = self.buffer.inner();
         inner.add_truncate_offset((epoch, None));
+        self.truncate_notify.notify_waiters();
     }
 
     pub(crate) fn rewind(&self, log_store_rewind_start_epoch: Option<u64>) {
@@ -455,14 +524,17 @@ pub(crate) fn new_log_store_buffer(
         metrics,
     });
     let update_notify = Arc::new(Notify::new());
+    let truncate_notify = Arc::new(Notify::new());
     let tx = LogStoreBufferSender {
         buffer: buffer.clone(),
         update_notify: update_notify.clone(),
+        truncate_notify: truncate_notify.clone(),
     };
 
     let rx = LogStoreBufferReceiver {
         buffer,
         update_notify,
+        truncate_notify,
     };
 
     (tx, rx)

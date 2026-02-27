@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use itertools::{Itertools, enumerate};
 use prometheus::IntGauge;
 use prometheus::core::{AtomicU64, GenericCounter};
+use risingwave_common::id::{JobId, TableId};
 use risingwave_hummock_sdk::compact_task::CompactTask;
 use risingwave_hummock_sdk::compaction_group::hummock_version_ext::object_size_map;
 use risingwave_hummock_sdk::level::Levels;
@@ -63,8 +64,8 @@ impl LocalTableMetrics {
 
 pub fn get_or_create_local_table_stat<'a>(
     metrics: &MetaMetrics,
-    table_id: u32,
-    local_metrics: &'a mut HashMap<u32, LocalTableMetrics>,
+    table_id: TableId,
+    local_metrics: &'a mut HashMap<TableId, LocalTableMetrics>,
 ) -> &'a mut LocalTableMetrics {
     local_metrics.entry(table_id).or_insert_with(|| {
         let table_label = format!("{}", table_id);
@@ -89,7 +90,7 @@ pub fn get_or_create_local_table_stat<'a>(
 
 pub fn trigger_local_table_stat(
     metrics: &MetaMetrics,
-    local_metrics: &mut HashMap<u32, LocalTableMetrics>,
+    local_metrics: &mut HashMap<TableId, LocalTableMetrics>,
     version_stats: &HummockVersionStats,
     table_stats_change: &PbTableStatsMap,
 ) {
@@ -113,7 +114,7 @@ pub fn trigger_local_table_stat(
 pub fn trigger_mv_stat(
     metrics: &MetaMetrics,
     version_stats: &HummockVersionStats,
-    mv_id_to_all_table_ids: Vec<(u32, Vec<u32>)>,
+    mv_id_to_all_table_ids: Vec<(JobId, Vec<TableId>)>,
 ) {
     metrics.materialized_view_stats.reset();
     for (mv_id, all_table_ids) in mv_id_to_all_table_ids {
@@ -441,11 +442,9 @@ pub fn trigger_pin_unpin_version_state(
     pinned_versions: &BTreeMap<HummockContextId, HummockPinnedVersion>,
 ) {
     if let Some(m) = pinned_versions.values().map(|v| v.min_pinned_id).min() {
-        metrics.min_pinned_version_id.set(m as i64);
+        metrics.min_pinned_version_id.set(m.as_i64_id());
     } else {
-        metrics
-            .min_pinned_version_id
-            .set(HummockVersionId::MAX.to_u64() as _);
+        metrics.min_pinned_version_id.set(u64::MAX as _);
     }
 }
 
@@ -486,6 +485,8 @@ pub fn trigger_gc_stat(
     metrics.stale_object_count.set(stale_object_count as _);
     // table change log
     for (table_id, logs) in &checkpoint.version.table_change_log {
+        let table_id_label = table_id.to_string();
+        let labels = [table_id_label.as_str()];
         let object_count = logs
             .iter()
             .map(|l| l.old_value.len() + l.new_value.len())
@@ -502,12 +503,17 @@ pub fn trigger_gc_stat(
             .sum::<usize>();
         metrics
             .table_change_log_object_count
-            .with_label_values(&[&format!("{table_id}")])
+            .with_label_values(&labels)
             .set(object_count as _);
         metrics
             .table_change_log_object_size
-            .with_label_values(&[&format!("{table_id}")])
+            .with_label_values(&labels)
             .set(object_size as _);
+        let min_epoch = logs.epochs().min().unwrap_or_default();
+        metrics
+            .table_change_log_min_epoch
+            .with_label_values(&labels)
+            .set(min_epoch as _);
     }
 }
 
@@ -616,11 +622,17 @@ pub fn trigger_split_stat(metrics: &MetaMetrics, version: &HummockVersion) {
     }
 }
 
-pub fn build_level_metrics_label(compaction_group_id: u64, level_idx: usize) -> String {
+pub fn build_level_metrics_label(
+    compaction_group_id: CompactionGroupId,
+    level_idx: usize,
+) -> String {
     format!("cg{}_L{}", compaction_group_id, level_idx)
 }
 
-pub fn build_level_l0_metrics_label(compaction_group_id: u64, overlapping: bool) -> String {
+pub fn build_level_l0_metrics_label(
+    compaction_group_id: CompactionGroupId,
+    overlapping: bool,
+) -> String {
     if overlapping {
         format!("cg{}_l0_sub_overlapping", compaction_group_id)
     } else {
@@ -629,7 +641,7 @@ pub fn build_level_l0_metrics_label(compaction_group_id: u64, overlapping: bool)
 }
 
 pub fn build_compact_task_stat_metrics_label(
-    compaction_group_id: u64,
+    compaction_group_id: CompactionGroupId,
     select_level: usize,
     target_level: usize,
 ) -> String {
@@ -640,7 +652,7 @@ pub fn build_compact_task_stat_metrics_label(
 }
 
 pub fn build_compact_task_l0_stat_metrics_label(
-    compaction_group_id: u64,
+    compaction_group_id: CompactionGroupId,
     overlapping: bool,
     partition: bool,
 ) -> String {

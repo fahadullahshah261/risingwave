@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2024 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use parking_lot::Mutex;
@@ -23,7 +23,9 @@ use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::table_watermark::TableWatermarks;
 use risingwave_hummock_sdk::vector_index::VectorIndexDelta;
 use risingwave_hummock_sdk::version::{GroupDelta, HummockVersion, HummockVersionDelta};
-use risingwave_hummock_sdk::{CompactionGroupId, FrontendHummockVersionDelta, HummockVersionId};
+use risingwave_hummock_sdk::{
+    CompactionGroupId, FrontendHummockVersionDelta, HummockSstableId, HummockVersionId,
+};
 use risingwave_pb::hummock::{
     CompatibilityVersion, GroupConstruct, HummockVersionDeltas, HummockVersionStats,
     StateTableInfoDelta,
@@ -48,7 +50,7 @@ fn trigger_version_stat(metrics: &MetaMetrics, current_version: &HummockVersion)
         .set(current_version.estimated_encode_len() as i64);
     metrics
         .current_version_id
-        .set(current_version.id.to_u64() as i64);
+        .set(current_version.id.as_i64_id());
 }
 
 pub(super) struct HummockVersionTransaction<'a> {
@@ -123,7 +125,7 @@ impl<'a> HummockVersionTransaction<'a> {
         new_table_watermarks: HashMap<TableId, TableWatermarks>,
         change_log_delta: HashMap<TableId, ChangeLogDelta>,
         vector_index_delta: HashMap<TableId, VectorIndexDelta>,
-        group_id_to_truncate_tables: HashMap<CompactionGroupId, Vec<TableId>>,
+        group_id_to_truncate_tables: HashMap<CompactionGroupId, HashSet<TableId>>,
     ) -> HummockVersionDelta {
         let mut new_version_delta = self.new_delta();
         new_version_delta.new_table_watermarks = new_table_watermarks;
@@ -142,7 +144,7 @@ impl<'a> HummockVersionTransaction<'a> {
                 group_config: Some(compaction_group.compaction_config().as_ref().clone()),
                 group_id: compaction_group.group_id(),
                 parent_group_id: StaticCompactionGroupId::NewCompactionGroup as CompactionGroupId,
-                new_sst_start_id: 0, // No need to set it when `NewCompactionGroup`
+                new_sst_start_id: HummockSstableId::default(), // No need to set it when `NewCompactionGroup`
                 table_ids: vec![],
                 version: CompatibilityVersion::LATEST as _,
                 split_key: None,
@@ -169,9 +171,7 @@ impl<'a> HummockVersionTransaction<'a> {
                 .or_default()
                 .group_deltas;
 
-            group_deltas.push(GroupDelta::TruncateTables(
-                table_ids.into_iter().map(|id| id.into()).collect(),
-            ));
+            group_deltas.push(GroupDelta::TruncateTables(table_ids.into_iter().collect()));
         }
 
         // update state table info

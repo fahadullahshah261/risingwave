@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,15 +22,18 @@ use risingwave_hummock_sdk::compaction_group::hummock_version_ext::{
     BranchedSstInfo, get_compaction_group_ids, get_table_compaction_group_id_mapping,
 };
 use risingwave_hummock_sdk::sstable_info::SstableInfo;
-use risingwave_hummock_sdk::table_stats::add_prost_table_stats_map;
-use risingwave_hummock_sdk::version::{HummockVersion, HummockVersionDelta};
+use risingwave_hummock_sdk::table_stats::{PbTableStatsMap, add_prost_table_stats_map};
+use risingwave_hummock_sdk::version::{
+    HummockVersion, HummockVersionDelta, MAX_HUMMOCK_VERSION_ID,
+};
 use risingwave_hummock_sdk::{
     CompactionGroupId, HummockContextId, HummockObjectId, HummockSstableId, HummockSstableObjectId,
     HummockVersionId, get_stale_object_ids,
 };
 use risingwave_pb::common::WorkerNode;
 use risingwave_pb::hummock::write_limits::WriteLimit;
-use risingwave_pb::hummock::{HummockPinnedVersion, HummockVersionStats, TableStats};
+use risingwave_pb::hummock::{HummockPinnedVersion, HummockVersionStats};
+use risingwave_pb::id::TableId;
 use risingwave_pb::meta::subscribe_response::{Info, Operation};
 
 use super::GroupStateValidator;
@@ -53,7 +56,7 @@ pub struct Versioning {
     pub disable_commit_epochs: bool,
     /// Latest hummock version
     pub current_version: HummockVersion,
-    pub local_metrics: HashMap<u32, LocalTableMetrics>,
+    pub local_metrics: HashMap<TableId, LocalTableMetrics>,
     pub time_travel_snapshot_interval_counter: u64,
     /// Used to avoid the attempts to rewrite the same SST to meta store
     pub last_time_travel_snapshot_sst_ids: HashSet<HummockSstableId>,
@@ -67,11 +70,11 @@ pub struct Versioning {
 
 impl ContextInfo {
     pub fn min_pinned_version_id(&self) -> HummockVersionId {
-        let mut min_pinned_version_id = HummockVersionId::MAX;
+        let mut min_pinned_version_id = MAX_HUMMOCK_VERSION_ID;
         for id in self
             .pinned_versions
             .values()
-            .map(|v| HummockVersionId::new(v.min_pinned_id))
+            .map(|v| v.min_pinned_id)
             .chain(self.version_safe_points.iter().cloned())
         {
             min_pinned_version_id = cmp::min(id, min_pinned_version_id);
@@ -306,7 +309,7 @@ pub(super) fn calc_new_write_limits(
                         .state_table_info
                         .compaction_group_member_table_ids(*id)
                         .iter()
-                        .map(|table_id| table_id.table_id)
+                        .copied()
                         .collect(),
                     reason: group_state.reason().unwrap().to_owned(),
                 },
@@ -323,7 +326,7 @@ pub(super) fn calc_new_write_limits(
 /// Note that the result is approximate value. See `estimate_table_stats`.
 fn rebuild_table_stats(version: &HummockVersion) -> HummockVersionStats {
     let mut stats = HummockVersionStats {
-        hummock_version_id: version.id.to_u64(),
+        hummock_version_id: version.id,
         table_stats: Default::default(),
     };
     for level in version.get_combined_levels() {
@@ -339,8 +342,8 @@ fn rebuild_table_stats(version: &HummockVersion) -> HummockVersionStats {
 /// - The file stats is evenly distributed among multiple tables within the file.
 /// - The total key size and total value size are estimated based on key range and file size.
 /// - Branched files may lead to an overestimation.
-fn estimate_table_stats(sst: &SstableInfo) -> HashMap<u32, TableStats> {
-    let mut changes: HashMap<u32, TableStats> = HashMap::default();
+fn estimate_table_stats(sst: &SstableInfo) -> PbTableStatsMap {
+    let mut changes: PbTableStatsMap = HashMap::default();
     let weighted_value =
         |value: i64| -> i64 { (value as f64 / sst.table_ids.len() as f64).ceil() as i64 };
     let key_range = &sst.key_range;
@@ -370,10 +373,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use itertools::Itertools;
     use risingwave_hummock_sdk::key_range::KeyRange;
     use risingwave_hummock_sdk::level::{Level, Levels};
     use risingwave_hummock_sdk::sstable_info::SstableInfoInner;
-    use risingwave_hummock_sdk::version::HummockVersion;
+    use risingwave_hummock_sdk::version::{HummockVersion, MAX_HUMMOCK_VERSION_ID};
     use risingwave_hummock_sdk::{CompactionGroupId, HummockVersionId};
     use risingwave_pb::hummock::write_limits::WriteLimit;
     use risingwave_pb::hummock::{HummockPinnedVersion, HummockVersionStats};
@@ -388,23 +392,23 @@ mod tests {
     #[test]
     fn test_min_pinned_version_id() {
         let mut context_info = ContextInfo::default();
-        assert_eq!(context_info.min_pinned_version_id(), HummockVersionId::MAX);
+        assert_eq!(context_info.min_pinned_version_id(), MAX_HUMMOCK_VERSION_ID);
         context_info.pinned_versions.insert(
-            1,
+            1.into(),
             HummockPinnedVersion {
-                context_id: 1,
-                min_pinned_id: 10,
+                context_id: 1.into(),
+                min_pinned_id: 10.into(),
             },
         );
-        assert_eq!(context_info.min_pinned_version_id().to_u64(), 10);
+        assert_eq!(context_info.min_pinned_version_id(), 10);
         context_info
             .version_safe_points
             .push(HummockVersionId::new(5));
-        assert_eq!(context_info.min_pinned_version_id().to_u64(), 5);
+        assert_eq!(context_info.min_pinned_version_id(), 5);
         context_info.version_safe_points.clear();
-        assert_eq!(context_info.min_pinned_version_id().to_u64(), 10);
+        assert_eq!(context_info.min_pinned_version_id(), 10);
         context_info.pinned_versions.clear();
-        assert_eq!(context_info.min_pinned_version_id(), HummockVersionId::MAX);
+        assert_eq!(context_info.min_pinned_version_id(), MAX_HUMMOCK_VERSION_ID);
     }
 
     #[test]
@@ -416,9 +420,9 @@ mod tests {
             |target_groups: &mut HashMap<CompactionGroupId, CompactionGroup>,
              sub_level_number_threshold: u64| {
                 target_groups.insert(
-                    1,
+                    1.into(),
                     CompactionGroup {
-                        group_id: 1,
+                        group_id: 1.into(),
                         compaction_config: Arc::new(
                             CompactionConfigBuilder::new()
                                 .level0_stop_write_threshold_sub_level_number(
@@ -434,9 +438,9 @@ mod tests {
             |target_groups: &mut HashMap<CompactionGroupId, CompactionGroup>,
              max_sst_count_threshold: u32| {
                 target_groups.insert(
-                    1,
+                    1.into(),
                     CompactionGroup {
-                        group_id: 1,
+                        group_id: 1.into(),
                         compaction_config: Arc::new(
                             CompactionConfigBuilder::new()
                                 .level0_stop_write_threshold_max_sst_count(Some(
@@ -452,9 +456,9 @@ mod tests {
             |target_groups: &mut HashMap<CompactionGroupId, CompactionGroup>,
              max_size_threshold: u64| {
                 target_groups.insert(
-                    1,
+                    1.into(),
                     CompactionGroup {
-                        group_id: 1,
+                        group_id: 1.into(),
                         compaction_config: Arc::new(
                             CompactionConfigBuilder::new()
                                 .level0_stop_write_threshold_max_size(Some(max_size_threshold))
@@ -467,9 +471,9 @@ mod tests {
         let mut target_groups: HashMap<CompactionGroupId, CompactionGroup> = Default::default();
         set_sub_level_number_threshold_for_group_1(&mut target_groups, 10);
         let origin_snapshot: HashMap<CompactionGroupId, WriteLimit> = [(
-            2,
+            2.into(),
             WriteLimit {
-                table_ids: vec![1, 2, 3],
+                table_ids: [1, 2, 3].into_iter().map_into().collect(),
                 reason: "for test".to_owned(),
             },
         )]
@@ -477,7 +481,7 @@ mod tests {
         .collect();
         let mut version: HummockVersion = Default::default();
         for group_id in 1..=3 {
-            version.levels.insert(group_id, Levels::default());
+            version.levels.insert(group_id.into(), Levels::default());
         }
         let new_write_limits =
             calc_new_write_limits(target_groups.clone(), origin_snapshot.clone(), &version);
@@ -540,7 +544,7 @@ mod tests {
         last_level.table_infos.extend(vec![
             SstableInfoInner {
                 key_range: KeyRange::default(),
-                table_ids: vec![1, 2, 3],
+                table_ids: vec![1.into(), 2.into(), 3.into()],
                 total_key_count: 100,
                 sst_size: 100,
                 uncompressed_file_size: 100,
@@ -549,7 +553,7 @@ mod tests {
             .into(),
             SstableInfoInner {
                 key_range: KeyRange::default(),
-                table_ids: vec![1, 2, 3],
+                table_ids: vec![1.into(), 2.into(), 3.into()],
                 total_key_count: 100,
                 sst_size: 100,
                 uncompressed_file_size: 100,
@@ -599,7 +603,7 @@ mod tests {
 
         set_level_0_max_sst_count_threshold_for_group_1(&mut target_groups, 100);
         let new_write_limits =
-            calc_new_write_limits(target_groups.clone(), origin_snapshot.clone(), &version);
+            calc_new_write_limits(target_groups, origin_snapshot.clone(), &version);
 
         assert_eq!(
             new_write_limits, origin_snapshot,
@@ -615,7 +619,7 @@ mod tests {
                 right: vec![1; 20].into(),
                 ..Default::default()
             },
-            table_ids: vec![1, 2, 3],
+            table_ids: vec![1.into(), 2.into(), 3.into()],
             total_key_count: 6000,
             uncompressed_file_size: 6_000_000,
             ..Default::default()
@@ -637,7 +641,7 @@ mod tests {
 
         for cg in 1..3 {
             version.levels.insert(
-                cg,
+                cg.into(),
                 Levels {
                     levels: vec![Level {
                         table_infos: vec![sst.clone()],
@@ -651,7 +655,7 @@ mod tests {
             hummock_version_id,
             table_stats,
         } = rebuild_table_stats(&version);
-        assert_eq!(hummock_version_id, version.id.to_u64());
+        assert_eq!(hummock_version_id, version.id);
         assert_eq!(table_stats.len(), 3);
         for (tid, stats) in table_stats {
             assert_eq!(
@@ -677,7 +681,7 @@ mod tests {
                 right: vec![1; 2000].into(),
                 ..Default::default()
             },
-            table_ids: vec![1, 2, 3],
+            table_ids: vec![1.into(), 2.into(), 3.into()],
             total_key_count: 6000,
             uncompressed_file_size: 60_000,
             ..Default::default()

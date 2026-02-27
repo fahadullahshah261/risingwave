@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,14 +22,13 @@ use std::sync::Arc;
 use risingwave_sqlparser::ast::{ExplainFormat, ExplainOptions, ExplainType};
 
 use super::property::WatermarkGroupId;
-use crate::Explain;
-use crate::binder::ShareId;
 use crate::expr::{CorrelatedId, SessionTimezone};
 use crate::handler::HandlerArgs;
 use crate::optimizer::LogicalPlanRef;
-use crate::optimizer::plan_node::{LogicalPlanRef as PlanRef, PlanNodeId};
+use crate::optimizer::plan_node::PlanNodeId;
 use crate::session::SessionImpl;
 use crate::utils::{OverwriteOptions, WithOptions};
+use crate::{Explain, TableCatalog};
 
 const RESERVED_ID_NUM: u16 = 10000;
 
@@ -56,9 +55,11 @@ pub struct OptimizerContext {
     /// Store the configs can be overwritten in with clause
     /// if not specified, use the value from session variable.
     overwrite_options: OverwriteOptions,
-    /// Store the mapping between `share_id` and the corresponding
-    /// `PlanRef`, used by rcte's planning. (e.g., in `LogicalCteRef`)
-    rcte_cache: RefCell<HashMap<ShareId, PlanRef>>,
+    /// Mapping from iceberg table identifier to current snapshot id.
+    /// Used to keep same snapshot id when multiple scans from the same iceberg table exist in a query.
+    iceberg_snapshot_id_map: RefCell<HashMap<String, Option<i64>>>,
+    /// Batch materialized view candidates for exact-match rewriting.
+    batch_mview_candidates: RefCell<Vec<MaterializedViewCandidate>>,
 
     /// Last assigned plan node ID.
     last_plan_node_id: Cell<i32>,
@@ -70,6 +71,12 @@ pub struct OptimizerContext {
     last_watermark_group_id: Cell<u32>,
 
     _phantom: PhantomUnsend,
+}
+
+#[derive(Clone, Debug)]
+pub struct MaterializedViewCandidate {
+    pub plan: LogicalPlanRef,
+    pub table: Arc<TableCatalog>,
 }
 
 pub(in crate::optimizer) struct LastAssignedIds {
@@ -91,7 +98,7 @@ impl OptimizerContext {
     /// Create a new [`OptimizerContext`] from the given [`HandlerArgs`] and [`ExplainOptions`].
     pub fn new(mut handler_args: HandlerArgs, explain_options: ExplainOptions) -> Self {
         let session_timezone = RefCell::new(SessionTimezone::new(
-            handler_args.session.config().timezone().to_owned(),
+            handler_args.session.config().timezone(),
         ));
         let overwrite_options = OverwriteOptions::new(&mut handler_args);
         Self {
@@ -105,7 +112,8 @@ impl OptimizerContext {
             session_timezone,
             total_rule_applied: RefCell::new(0),
             overwrite_options,
-            rcte_cache: RefCell::new(HashMap::new()),
+            iceberg_snapshot_id_map: RefCell::new(HashMap::new()),
+            batch_mview_candidates: RefCell::new(Vec::new()),
 
             last_plan_node_id: Cell::new(RESERVED_ID_NUM.into()),
             last_correlated_id: Cell::new(0),
@@ -131,7 +139,8 @@ impl OptimizerContext {
             session_timezone: RefCell::new(SessionTimezone::new("UTC".into())),
             total_rule_applied: RefCell::new(0),
             overwrite_options: OverwriteOptions::default(),
-            rcte_cache: RefCell::new(HashMap::new()),
+            iceberg_snapshot_id_map: RefCell::new(HashMap::new()),
+            batch_mview_candidates: RefCell::new(Vec::new()),
 
             last_plan_node_id: Cell::new(0),
             last_correlated_id: Cell::new(0),
@@ -257,6 +266,16 @@ impl OptimizerContext {
         &self.overwrite_options
     }
 
+    pub fn add_batch_mview_candidate(&self, table: Arc<TableCatalog>, plan: LogicalPlanRef) {
+        self.batch_mview_candidates
+            .borrow_mut()
+            .push(MaterializedViewCandidate { plan, table });
+    }
+
+    pub fn batch_mview_candidates(&self) -> std::cell::Ref<'_, Vec<MaterializedViewCandidate>> {
+        self.batch_mview_candidates.borrow()
+    }
+
     pub fn session_ctx(&self) -> &Arc<SessionImpl> {
         &self.session_ctx
     }
@@ -279,12 +298,8 @@ impl OptimizerContext {
         self.session_timezone.borrow().timezone()
     }
 
-    pub fn get_rcte_cache_plan(&self, id: &ShareId) -> Option<PlanRef> {
-        self.rcte_cache.borrow().get(id).cloned()
-    }
-
-    pub fn insert_rcte_cache_plan(&self, id: ShareId, plan: PlanRef) {
-        self.rcte_cache.borrow_mut().insert(id, plan);
+    pub fn iceberg_snapshot_id_map(&self) -> RefMut<'_, HashMap<String, Option<i64>>> {
+        self.iceberg_snapshot_id_map.borrow_mut()
     }
 }
 

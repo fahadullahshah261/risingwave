@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,13 +13,12 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 
 use risingwave_common::acl::{AclMode, AclModeSet};
+use risingwave_common::catalog::{DatabaseId, ObjectId, SchemaId};
 use risingwave_pb::user::grant_privilege::Object as GrantObject;
 use risingwave_pb::user::{PbAction, PbAuthInfo, PbGrantPrivilege, PbUserInfo};
 
-use crate::catalog::{DatabaseId, SchemaId};
 use crate::user::UserId;
 
 /// `UserCatalog` is responsible for managing user's information.
@@ -39,7 +38,7 @@ pub struct UserCatalog {
     // TODO: merge it after we fully migrate to sql-backend.
     pub database_acls: HashMap<DatabaseId, AclModeSet>,
     pub schema_acls: HashMap<SchemaId, AclModeSet>,
-    pub object_acls: HashMap<u32, AclModeSet>,
+    pub object_acls: HashMap<ObjectId, AclModeSet>,
 }
 
 impl From<PbUserInfo> for UserCatalog {
@@ -79,33 +78,59 @@ impl UserCatalog {
         }
     }
 
-    fn get_acl_entry(&mut self, object: GrantObject) -> Entry<'_, u32, AclModeSet> {
+    fn get_or_insert_acl(&mut self, object: GrantObject) -> &mut AclModeSet {
         match object {
-            GrantObject::DatabaseId(id) => self.database_acls.entry(id),
-            GrantObject::SchemaId(id) => self.schema_acls.entry(id),
-            GrantObject::TableId(id)
-            | GrantObject::SourceId(id)
-            | GrantObject::SinkId(id)
-            | GrantObject::ViewId(id)
-            | GrantObject::FunctionId(id)
-            | GrantObject::SubscriptionId(id)
-            | GrantObject::ConnectionId(id)
-            | GrantObject::SecretId(id) => self.object_acls.entry(id),
+            GrantObject::DatabaseId(id) => {
+                self.database_acls.entry(id).or_insert(AclModeSet::empty())
+            }
+            GrantObject::SchemaId(id) => self.schema_acls.entry(id).or_insert(AclModeSet::empty()),
+            GrantObject::TableId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::SourceId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::SinkId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::ViewId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::FunctionId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::SubscriptionId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::ConnectionId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
+            GrantObject::SecretId(id) => self
+                .object_acls
+                .entry(id.as_object_id())
+                .or_insert(AclModeSet::empty()),
         }
     }
 
-    fn get_acl(&self, object: &GrantObject) -> Option<&AclModeSet> {
+    fn get_acl(&self, object: GrantObject) -> Option<&AclModeSet> {
         match object {
-            GrantObject::DatabaseId(id) => self.database_acls.get(id),
-            GrantObject::SchemaId(id) => self.schema_acls.get(id),
-            GrantObject::TableId(id)
-            | GrantObject::SourceId(id)
-            | GrantObject::SinkId(id)
-            | GrantObject::ViewId(id)
-            | GrantObject::FunctionId(id)
-            | GrantObject::SubscriptionId(id)
-            | GrantObject::ConnectionId(id)
-            | GrantObject::SecretId(id) => self.object_acls.get(id),
+            GrantObject::DatabaseId(id) => self.database_acls.get(&id),
+            GrantObject::SchemaId(id) => self.schema_acls.get(&id),
+            GrantObject::TableId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::SourceId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::SinkId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::ViewId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::FunctionId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::SubscriptionId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::ConnectionId(id) => self.object_acls.get(&id.as_object_id()),
+            GrantObject::SecretId(id) => self.object_acls.get(&id.as_object_id()),
         }
     }
 
@@ -115,9 +140,7 @@ impl UserCatalog {
         self.object_acls.clear();
         let privileges = self.grant_privileges.clone();
         for privilege in privileges {
-            let entry = self
-                .get_acl_entry(privilege.object.unwrap())
-                .or_insert(AclModeSet::empty());
+            let entry = self.get_or_insert_acl(privilege.object.unwrap());
             for awo in privilege.action_with_opts {
                 entry
                     .modes
@@ -167,13 +190,13 @@ impl UserCatalog {
         self.refresh_acl_modes();
     }
 
-    pub fn has_privilege(&self, object: &GrantObject, mode: AclMode) -> bool {
-        self.get_acl(object)
+    pub fn has_privilege(&self, object: impl Into<GrantObject>, mode: AclMode) -> bool {
+        self.get_acl(object.into())
             .is_some_and(|acl_set| acl_set.has_mode(mode))
     }
 
     pub fn has_schema_usage_privilege(&self, schema_id: SchemaId) -> bool {
-        self.has_privilege(&GrantObject::SchemaId(schema_id), AclMode::Usage)
+        self.has_privilege(schema_id, AclMode::Usage)
     }
 
     pub fn check_privilege_with_grant_option(
@@ -205,7 +228,7 @@ impl UserCatalog {
         action_map.values().all(|&found| found)
     }
 
-    pub fn check_object_visibility(&self, obj_id: u32) -> bool {
+    pub fn check_object_visibility(&self, obj_id: ObjectId) -> bool {
         if self.is_super {
             return true;
         }

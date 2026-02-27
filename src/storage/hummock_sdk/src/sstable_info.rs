@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2024 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ use std::mem::size_of;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use risingwave_common::catalog::TableId;
 use risingwave_pb::hummock::{PbBloomFilterType, PbKeyRange, PbSstableInfo};
 
 use crate::key_range::KeyRange;
@@ -29,7 +30,7 @@ pub struct SstableInfoInner {
     pub sst_id: HummockSstableId,
     pub key_range: KeyRange,
     pub file_size: u64,
-    pub table_ids: Vec<u32>,
+    pub table_ids: Vec<TableId>,
     pub meta_offset: u64,
     pub stale_key_count: u64,
     pub total_key_count: u64,
@@ -70,8 +71,8 @@ impl From<PbSstableInfo> for SstableInfoInner {
     fn from(pb_sstable_info: PbSstableInfo) -> Self {
         assert!(pb_sstable_info.table_ids.is_sorted());
         Self {
-            object_id: pb_sstable_info.object_id.into(),
-            sst_id: pb_sstable_info.sst_id.into(),
+            object_id: pb_sstable_info.object_id,
+            sst_id: pb_sstable_info.sst_id,
             key_range: {
                 // Due to the stripped key range, the key range may be `None`
                 if let Some(pb_keyrange) = pb_sstable_info.key_range {
@@ -108,8 +109,8 @@ impl From<&PbSstableInfo> for SstableInfoInner {
     fn from(pb_sstable_info: &PbSstableInfo) -> Self {
         assert!(pb_sstable_info.table_ids.is_sorted());
         Self {
-            object_id: pb_sstable_info.object_id.into(),
-            sst_id: pb_sstable_info.sst_id.into(),
+            object_id: pb_sstable_info.object_id,
+            sst_id: pb_sstable_info.sst_id,
             key_range: {
                 if let Some(pb_keyrange) = &pb_sstable_info.key_range {
                     KeyRange {
@@ -145,8 +146,8 @@ impl From<SstableInfoInner> for PbSstableInfo {
     fn from(sstable_info: SstableInfoInner) -> Self {
         assert!(sstable_info.table_ids.is_sorted());
         PbSstableInfo {
-            object_id: sstable_info.object_id.inner(),
-            sst_id: sstable_info.sst_id.inner(),
+            object_id: sstable_info.object_id,
+            sst_id: sstable_info.sst_id,
             key_range: {
                 let keyrange = sstable_info.key_range;
                 if keyrange.inf_key_range() {
@@ -183,8 +184,8 @@ impl From<&SstableInfoInner> for PbSstableInfo {
     fn from(sstable_info: &SstableInfoInner) -> Self {
         assert!(sstable_info.table_ids.is_sorted());
         PbSstableInfo {
-            object_id: sstable_info.object_id.inner(),
-            sst_id: sstable_info.sst_id.inner(),
+            object_id: sstable_info.object_id,
+            sst_id: sstable_info.sst_id,
             key_range: {
                 let keyrange = &sstable_info.key_range;
                 if keyrange.inf_key_range() {

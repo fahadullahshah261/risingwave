@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ use risingwave_meta_model::compaction_task::CompactionTask;
 use risingwave_meta_model::hummock_version_delta::FullVersionDelta;
 use risingwave_meta_model::hummock_version_stats::TableStats;
 use risingwave_meta_model::{
-    CompactionGroupId, CompactionTaskId, HummockVersionId, WorkerId, compaction_config,
-    compaction_status, compaction_task, hummock_pinned_snapshot, hummock_pinned_version,
-    hummock_version_delta, hummock_version_stats,
+    CompactionGroupId, CompactionTaskId, HummockVersionId, compaction_config, compaction_status,
+    compaction_task, hummock_pinned_snapshot, hummock_pinned_version, hummock_version_delta,
+    hummock_version_stats,
 };
 use risingwave_pb::hummock::{
     CompactTaskAssignment, HummockPinnedSnapshot, HummockPinnedVersion, HummockVersionStats,
@@ -50,7 +50,7 @@ impl From<sea_orm::DbErr> for MetadataModelError {
 impl Transactional<Transaction> for CompactionGroup {
     async fn upsert_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
         let m = compaction_config::ActiveModel {
-            compaction_group_id: Set(self.group_id.try_into().unwrap()),
+            compaction_group_id: Set(self.group_id),
             config: Set(CompactionConfig::from(&(*self.compaction_config))),
         };
         compaction_config::Entity::insert(m)
@@ -78,7 +78,7 @@ impl Transactional<Transaction> for CompactionGroup {
 impl Transactional<Transaction> for CompactStatus {
     async fn upsert_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
         let m = compaction_status::ActiveModel {
-            compaction_group_id: Set(self.compaction_group_id.try_into().unwrap()),
+            compaction_group_id: Set(self.compaction_group_id),
             status: Set(LevelHandlers::from(
                 self.level_handlers.iter().map_into().collect_vec(),
             )),
@@ -107,10 +107,10 @@ impl Transactional<Transaction> for CompactStatus {
 #[async_trait::async_trait]
 impl Transactional<Transaction> for CompactTaskAssignment {
     async fn upsert_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
-        let task = self.compact_task.to_owned().unwrap();
+        let task = self.compact_task.clone().unwrap();
         let m = compaction_task::ActiveModel {
             id: Set(task.task_id.try_into().unwrap()),
-            context_id: Set(self.context_id.try_into().unwrap()),
+            context_id: Set(self.context_id),
             task: Set(CompactionTask::from(&task)),
         };
         compaction_task::Entity::insert(m)
@@ -141,8 +141,8 @@ impl Transactional<Transaction> for CompactTaskAssignment {
 impl Transactional<Transaction> for HummockPinnedVersion {
     async fn upsert_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
         let m = hummock_pinned_version::ActiveModel {
-            context_id: Set(self.context_id.try_into().unwrap()),
-            min_pinned_id: Set(self.min_pinned_id.try_into().unwrap()),
+            context_id: Set(self.context_id),
+            min_pinned_id: Set(self.min_pinned_id),
         };
         hummock_pinned_version::Entity::insert(m)
             .on_conflict(
@@ -156,7 +156,7 @@ impl Transactional<Transaction> for HummockPinnedVersion {
     }
 
     async fn delete_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
-        hummock_pinned_version::Entity::delete_by_id(WorkerId::try_from(self.context_id).unwrap())
+        hummock_pinned_version::Entity::delete_by_id(self.context_id)
             .exec(trx)
             .await?;
         Ok(())
@@ -167,7 +167,7 @@ impl Transactional<Transaction> for HummockPinnedVersion {
 impl Transactional<Transaction> for HummockPinnedSnapshot {
     async fn upsert_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
         let m = hummock_pinned_snapshot::ActiveModel {
-            context_id: Set(self.context_id.try_into().unwrap()),
+            context_id: Set(self.context_id),
             min_pinned_snapshot: Set(self.minimal_pinned_snapshot.try_into().unwrap()),
         };
         hummock_pinned_snapshot::Entity::insert(m)
@@ -182,7 +182,7 @@ impl Transactional<Transaction> for HummockPinnedSnapshot {
     }
 
     async fn delete_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
-        hummock_pinned_snapshot::Entity::delete_by_id(WorkerId::try_from(self.context_id).unwrap())
+        hummock_pinned_snapshot::Entity::delete_by_id(self.context_id)
             .exec(trx)
             .await?;
         Ok(())
@@ -193,7 +193,7 @@ impl Transactional<Transaction> for HummockPinnedSnapshot {
 impl Transactional<Transaction> for HummockVersionStats {
     async fn upsert_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
         let m = hummock_version_stats::ActiveModel {
-            id: Set(self.hummock_version_id.try_into().unwrap()),
+            id: Set(self.hummock_version_id),
             stats: Set(TableStats(self.table_stats.clone())),
         };
         hummock_version_stats::Entity::insert(m)
@@ -221,8 +221,8 @@ impl Transactional<Transaction> for HummockVersionStats {
 impl Transactional<Transaction> for HummockVersionDelta {
     async fn upsert_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
         let m = hummock_version_delta::ActiveModel {
-            id: Set(self.id.to_u64().try_into().unwrap()),
-            prev_id: Set(self.prev_id.to_u64().try_into().unwrap()),
+            id: Set(self.id),
+            prev_id: Set(self.prev_id),
             max_committed_epoch: Set(0.into()),
             safe_epoch: Set(0.into()),
             trivial_move: Set(self.trivial_move),
@@ -246,28 +246,23 @@ impl Transactional<Transaction> for HummockVersionDelta {
     }
 
     async fn delete_in_transaction(&self, trx: &mut Transaction) -> MetadataModelResult<()> {
-        hummock_version_delta::Entity::delete_by_id(
-            HummockVersionId::try_from(self.id.to_u64()).unwrap(),
-        )
-        .exec(trx)
-        .await?;
+        hummock_version_delta::Entity::delete_by_id(self.id)
+            .exec(trx)
+            .await?;
         Ok(())
     }
 }
 
 impl From<compaction_config::Model> for CompactionGroup {
     fn from(value: compaction_config::Model) -> Self {
-        Self::new(
-            value.compaction_group_id.try_into().unwrap(),
-            value.config.to_protobuf(),
-        )
+        Self::new(value.compaction_group_id, value.config.to_protobuf())
     }
 }
 
 impl From<compaction_status::Model> for CompactStatus {
     fn from(value: compaction_status::Model) -> Self {
         Self {
-            compaction_group_id: value.compaction_group_id.try_into().unwrap(),
+            compaction_group_id: value.compaction_group_id,
             level_handlers: value.status.to_protobuf().iter().map_into().collect(),
         }
     }

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::bail;
 use itertools::Itertools;
 use risingwave_common::catalog::{Field, Schema, is_source_backfill_table};
+use risingwave_common::id::{FragmentId, JobId, TableId};
 use risingwave_common::types::{DataType, ScalarImpl};
 
 use super::prelude::{PlanRef, *};
@@ -63,9 +64,10 @@ impl TableFunctionToInternalSourceBackfillProgressRule {
                 Field::new("job_id", DataType::Int32),
                 Field::new("fragment_id", DataType::Int32),
                 Field::new("backfill_state_table_id", DataType::Int32),
+                Field::new("partition_id", DataType::Varchar),
                 Field::new("backfill_progress", DataType::Jsonb),
             ];
-            let plan = LogicalValues::new(vec![], Schema::new(fields), ctx.clone());
+            let plan = LogicalValues::new(vec![], Schema::new(fields), ctx);
             return Ok(plan.into());
         }
 
@@ -82,16 +84,21 @@ impl TableFunctionToInternalSourceBackfillProgressRule {
     }
 
     fn build_scan(ctx: Rc<OptimizerContext>, table: Arc<TableCatalog>) -> LogicalScan {
-        LogicalScan::create(table, ctx.clone(), None)
+        LogicalScan::create(table, ctx, None)
     }
 
     fn build_project(
         backfill_info: &SourceBackfillInfo,
         scan: PlanRef,
     ) -> anyhow::Result<LogicalProject> {
-        let job_id_expr = Self::build_u32_expr(backfill_info.job_id);
-        let fragment_id_expr = Self::build_u32_expr(backfill_info.fragment_id);
-        let table_id_expr = Self::build_u32_expr(backfill_info.table_id);
+        let job_id_expr = Self::build_u32_expr(backfill_info.job_id.as_raw_id());
+        let fragment_id_expr = Self::build_u32_expr(backfill_info.fragment_id.as_raw_id());
+        let table_id_expr = Self::build_u32_expr(backfill_info.table_id.as_raw_id());
+
+        let partition_id = ExprImpl::InputRef(Box::new(InputRef {
+            index: backfill_info.partition_id_column_index,
+            data_type: DataType::Varchar,
+        }));
 
         let backfill_progress = ExprImpl::InputRef(Box::new(InputRef {
             index: backfill_info.backfill_progress_column_index,
@@ -104,6 +111,7 @@ impl TableFunctionToInternalSourceBackfillProgressRule {
                 job_id_expr,
                 fragment_id_expr,
                 table_id_expr,
+                partition_id,
                 backfill_progress,
             ],
         ))
@@ -132,15 +140,16 @@ impl TableFunctionToInternalSourceBackfillProgressRule {
 }
 
 struct SourceBackfillInfo {
-    job_id: u32,
-    fragment_id: u32,
-    table_id: u32,
+    job_id: JobId,
+    fragment_id: FragmentId,
+    table_id: TableId,
+    partition_id_column_index: usize,
     backfill_progress_column_index: usize,
 }
 
 impl SourceBackfillInfo {
     fn new(table: &TableCatalog) -> anyhow::Result<Self> {
-        let Some(job_id) = table.job_id.map(|id| id.table_id) else {
+        let Some(job_id) = table.job_id else {
             bail!("`job_id` column not found in source backfill table catalog");
         };
         let Some(backfill_progress_column_index) = table
@@ -153,13 +162,24 @@ impl SourceBackfillInfo {
                 StreamSourceScan::BACKFILL_PROGRESS_COLUMN_NAME
             );
         };
+        let Some(partition_id_column_index) = table
+            .columns
+            .iter()
+            .position(|c| c.name() == StreamSourceScan::PARTITION_ID_COLUMN_NAME)
+        else {
+            bail!(
+                "`{}` column not found in source backfill state table schema",
+                StreamSourceScan::PARTITION_ID_COLUMN_NAME
+            );
+        };
         let fragment_id = table.fragment_id;
-        let table_id = table.id.table_id;
+        let table_id = table.id;
 
         Ok(Self {
             job_id,
             fragment_id,
             table_id,
+            partition_id_column_index,
             backfill_progress_column_index,
         })
     }

@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ use super::{
     BatchOverWindow, ColPrunable, ExprRewritable, Logical, LogicalFilter,
     LogicalPlanRef as PlanRef, LogicalProject, PlanBase, PlanTreeNodeUnary, PredicatePushdown,
     StreamEowcOverWindow, StreamEowcSort, StreamOverWindow, ToBatch, ToStream,
-    gen_filter_and_pushdown,
+    gen_filter_and_pushdown, try_enforce_locality_requirement,
 };
 use crate::error::{ErrorCode, Result, RwError};
 use crate::expr::{
@@ -126,7 +126,7 @@ impl<'a> LogicalOverWindowBuilder<'a> {
                         agg_call.args.clone(),
                         false, // we don't support `IGNORE NULLS` for these functions now
                         partition_by.clone(),
-                        agg_call.order_by.clone(),
+                        agg_call.order_by,
                         frame.clone(),
                     )?,
                 ))
@@ -631,17 +631,6 @@ impl ToBatch for LogicalOverWindow {
             "must apply OverWindowSplitRule before generating physical plan"
         );
 
-        // TODO(rc): Let's not introduce too many cases at once. Later we may decide to support
-        // empty PARTITION BY by simply removing the following check.
-        let partition_key_indices = self.window_functions()[0]
-            .partition_by
-            .iter()
-            .map(|e| e.index())
-            .collect_vec();
-        if partition_key_indices.is_empty() {
-            empty_partition_by_not_implemented!();
-        }
-
         let input = self.input().to_batch()?;
         let core = self.core.clone_with_input(input);
         Ok(BatchOverWindow::new(core).into())
@@ -670,12 +659,8 @@ impl ToStream for LogicalOverWindow {
         if partition_key_indices.is_empty() {
             empty_partition_by_not_implemented!();
         }
-        let input = self
-            .core
-            .input
-            .try_better_locality(&partition_key_indices)
-            .unwrap_or_else(|| self.core.input.clone());
-        let stream_input = input.to_stream(ctx)?;
+
+        let stream_input = self.input().to_stream(ctx)?;
 
         if ctx.emit_on_window_close() {
             // Emit-On-Window-Close case
@@ -692,9 +677,13 @@ impl ToStream for LogicalOverWindow {
                 .watermark_columns()
                 .contains(order_by[0].column_index)
             {
-                return Err(ErrorCode::InvalidInputSyntax(
-                    "The column ordered by must be a watermark column".to_owned(),
-                )
+                let order_by_col = self.input().schema().fields()[order_by[0].column_index]
+                    .name
+                    .clone();
+                return Err(ErrorCode::InvalidInputSyntax(format!(
+                    "The ORDER BY column `{}` must be a watermark column",
+                    order_by_col
+                ))
                 .into());
             }
             let order_key_index = order_by[0].column_index;
@@ -733,7 +722,17 @@ impl ToStream for LogicalOverWindow {
         &self,
         ctx: &mut RewriteStreamContext,
     ) -> Result<(PlanRef, ColIndexMapping)> {
-        let (input, input_col_change) = self.core.input.logical_rewrite_for_stream(ctx)?;
+        let partition_key_indices = self.window_functions()[0]
+            .partition_by
+            .iter()
+            .map(|e| e.index())
+            .collect_vec();
+        let logical_input = if partition_key_indices.is_empty() {
+            self.input()
+        } else {
+            try_enforce_locality_requirement(self.input(), &partition_key_indices)
+        };
+        let (input, input_col_change) = logical_input.logical_rewrite_for_stream(ctx)?;
         let (new_self, output_col_change) = self.rewrite_with_input(input, input_col_change);
         Ok((new_self.into(), output_col_change))
     }

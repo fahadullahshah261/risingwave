@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@ use fail::fail_point;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 use itertools::Itertools;
-use risingwave_common::catalog::TableId;
 use risingwave_hummock_sdk::change_log::build_table_change_log_delta;
 use risingwave_hummock_sdk::compact_task::CompactTask;
 use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
@@ -31,7 +30,8 @@ use risingwave_hummock_sdk::sstable_info::SstableInfo;
 use risingwave_hummock_sdk::vector_index::VectorIndexDelta;
 use risingwave_hummock_sdk::version::HummockVersion;
 use risingwave_hummock_sdk::{
-    HummockContextId, HummockEpoch, HummockVersionId, LocalSstableInfo, ObjectIdRange, SyncResult,
+    CompactionGroupId, HummockContextId, HummockEpoch, HummockVersionId, LocalSstableInfo,
+    ObjectIdRange, SyncResult,
 };
 use risingwave_pb::common::{HostAddress, WorkerType};
 use risingwave_pb::hummock::compact_task::{TaskStatus, TaskType};
@@ -42,6 +42,7 @@ use risingwave_pb::hummock::{
     compact_task,
 };
 use risingwave_pb::iceberg_compaction::SubscribeIcebergCompactionEventRequest;
+use risingwave_pb::id::{HummockSstableId, JobId, TableId};
 use risingwave_rpc_client::error::{Result, RpcError};
 use risingwave_rpc_client::{
     CompactionEventItem, HummockMetaClient, HummockMetaClientChangeLogInfo,
@@ -74,7 +75,7 @@ impl MockHummockMetaClient {
         MockHummockMetaClient {
             hummock_manager,
             context_id,
-            compact_context_id: AtomicU32::new(context_id),
+            compact_context_id: AtomicU32::new(context_id.as_raw_id()),
             sst_offset: 0,
         }
     }
@@ -87,7 +88,7 @@ impl MockHummockMetaClient {
         Self {
             hummock_manager,
             context_id,
-            compact_context_id: AtomicU32::new(context_id),
+            compact_context_id: AtomicU32::new(context_id.as_raw_id()),
             sst_offset,
         }
     }
@@ -95,7 +96,7 @@ impl MockHummockMetaClient {
     pub async fn get_compact_task(&self) -> Option<CompactTask> {
         self.hummock_manager
             .get_compact_task(
-                StaticCompactionGroupId::StateDefault.into(),
+                StaticCompactionGroupId::StateDefault,
                 &mut default_compaction_selector(),
             )
             .await
@@ -150,7 +151,7 @@ impl HummockMetaClient for MockHummockMetaClient {
             .state_table_info
             .info()
             .keys()
-            .map(|table_id| table_id.table_id)
+            .copied()
             .collect::<BTreeSet<_>>();
 
         let commit_table_ids = sync_result
@@ -163,12 +164,7 @@ impl HummockMetaClient for MockHummockMetaClient {
                     .iter()
                     .flat_map(|sstable| sstable.sst_info.table_ids.clone())
             })
-            .chain(
-                sync_result
-                    .table_watermarks
-                    .keys()
-                    .map(|table_id| table_id.table_id),
-            )
+            .chain(sync_result.table_watermarks.keys().copied())
             .chain(table_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
 
@@ -179,11 +175,7 @@ impl HummockMetaClient for MockHummockMetaClient {
             vec![]
         } else {
             vec![NewTableFragmentInfo {
-                table_ids: commit_table_ids
-                    .iter()
-                    .cloned()
-                    .map(TableId::from)
-                    .collect(),
+                table_ids: commit_table_ids.iter().cloned().collect(),
             }]
         };
 
@@ -224,7 +216,7 @@ impl HummockMetaClient for MockHummockMetaClient {
                 tables_to_commit: commit_table_ids
                     .iter()
                     .cloned()
-                    .map(|table_id| (TableId::new(table_id), epoch))
+                    .map(|table_id| (table_id, epoch))
                     .collect(),
                 truncate_tables: HashSet::new(),
             })
@@ -235,10 +227,10 @@ impl HummockMetaClient for MockHummockMetaClient {
 
     async fn trigger_manual_compaction(
         &self,
-        _compaction_group_id: u64,
-        _table_id: u32,
+        _compaction_group_id: CompactionGroupId,
+        _table_id: JobId,
         _level: u32,
-        _sst_ids: Vec<u64>,
+        _sst_ids: Vec<HummockSstableId>,
     ) -> Result<()> {
         todo!()
     }
@@ -275,13 +267,13 @@ impl HummockMetaClient for MockHummockMetaClient {
             .hummock_manager
             .compactor_manager
             .clone()
-            .add_compactor(context_id as _);
+            .add_compactor(context_id);
 
         let (request_sender, mut request_receiver) =
             unbounded_channel::<SubscribeCompactionEventRequest>();
 
         self.compact_context_id
-            .store(context_id as _, Ordering::Release);
+            .store(context_id.as_raw_id(), Ordering::Release);
 
         let (task_tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -290,15 +282,12 @@ impl HummockMetaClient for MockHummockMetaClient {
 
         let handle = tokio::spawn(async move {
             loop {
-                let group_and_type = hummock_manager_compact
-                    .auto_pick_compaction_group_and_type()
-                    .await;
-
-                if group_and_type.is_none() {
+                let snapshot = hummock_manager_compact.compaction_state.snapshot();
+                let Some((groups, task_type)) = snapshot.pick_compaction_groups_and_type() else {
                     break;
-                }
+                };
 
-                let (group, task_type) = group_and_type.unwrap();
+                let group = groups[0];
 
                 if let TaskType::Ttl = task_type {
                     match hummock_manager_compact
@@ -365,10 +354,7 @@ impl HummockMetaClient for MockHummockMetaClient {
                                 .map(SstableInfo::from)
                                 .collect_vec(),
                             Some(table_stats_change),
-                            object_timestamps
-                                .into_iter()
-                                .map(|(id, ts)| (id.into(), ts))
-                                .collect(),
+                            object_timestamps,
                         )
                         .await
                 {
@@ -391,7 +377,7 @@ impl HummockMetaClient for MockHummockMetaClient {
     async fn get_version_by_epoch(
         &self,
         _epoch: HummockEpoch,
-        _table_id: u32,
+        _table_id: TableId,
     ) -> Result<PbHummockVersion> {
         unimplemented!()
     }

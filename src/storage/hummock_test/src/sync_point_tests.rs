@@ -1,4 +1,4 @@
-// Copyright 2025 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use foyer::Hint;
-use risingwave_common::catalog::TableId;
 use risingwave_common::catalog::hummock::CompactionFilterFlag;
 use risingwave_common::hash::VirtualNode;
 use risingwave_common::util::epoch::test_epoch;
-use risingwave_hummock_sdk::HummockVersionId;
 use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
 use risingwave_hummock_sdk::key::{next_key, user_key};
 use risingwave_hummock_sdk::table_stats::to_prost_table_stats_map;
+use risingwave_hummock_sdk::version::MAX_HUMMOCK_VERSION_ID;
 use risingwave_meta::hummock::compaction::compaction_config::CompactionConfigBuilder;
 use risingwave_meta::hummock::compaction::selector::ManualCompactionOption;
 use risingwave_meta::hummock::test_utils::{setup_compute_env, setup_compute_env_with_config};
@@ -188,7 +187,7 @@ pub async fn compact_once(
     // 2. get compact task
     let mut compact_task = hummock_manager_ref
         .manual_get_compact_task(
-            StaticCompactionGroupId::StateDefault.into(),
+            StaticCompactionGroupId::StateDefault,
             manual_compcation_option,
         )
         .await
@@ -236,7 +235,7 @@ async fn test_syncpoints_get_in_delete_range_boundary() {
         hummock_manager_ref.clone(),
         worker_id as _,
     ));
-    let existing_table_id: u32 = 1;
+    let existing_table_id = 1.into();
 
     let storage = get_hummock_storage(
         hummock_meta_client.clone(),
@@ -268,7 +267,7 @@ async fn test_syncpoints_get_in_delete_range_boundary() {
     ));
 
     let mut local = storage
-        .new_local(NewLocalOptions::for_test(existing_table_id.into()))
+        .new_local(NewLocalOptions::for_test(existing_table_id))
         .await;
 
     // 1. add sstables
@@ -450,7 +449,7 @@ async fn test_syncpoints_get_in_delete_range_boundary() {
     // 4. get the latest version and check
     let version = hummock_manager_ref.get_current_version().await;
     let base_level = &version
-        .get_compaction_group_levels(StaticCompactionGroupId::StateDefault.into())
+        .get_compaction_group_levels(StaticCompactionGroupId::StateDefault)
         .levels[4];
     assert_eq!(base_level.table_infos.len(), 3);
     assert!(base_level.table_infos[0].key_range.right_exclusive);
@@ -460,7 +459,7 @@ async fn test_syncpoints_get_in_delete_range_boundary() {
     );
     storage.wait_version(version).await;
     let read_options = ReadOptions {
-        table_id: TableId::from(existing_table_id),
+        table_id: existing_table_id,
         cache_policy: CachePolicy::Fill(Hint::Normal),
         ..Default::default()
     };
@@ -527,7 +526,7 @@ async fn test_syncpoints_hummock_version_safe_point() {
     let (_env, hummock_manager, _, _) = setup_compute_env(80).await;
     assert_eq!(
         hummock_manager.get_min_pinned_version_id().await,
-        HummockVersionId::MAX
+        MAX_HUMMOCK_VERSION_ID
     );
     let v = hummock_manager.get_current_version().await;
     let sp = hummock_manager.register_safe_point().await;
@@ -536,7 +535,7 @@ async fn test_syncpoints_hummock_version_safe_point() {
     hummock_manager.unregister_safe_point(sp.id).await;
     assert_eq!(
         hummock_manager.get_min_pinned_version_id().await,
-        HummockVersionId::MAX
+        MAX_HUMMOCK_VERSION_ID
     );
 
     let sp = hummock_manager.register_safe_point().await;
@@ -550,6 +549,6 @@ async fn test_syncpoints_hummock_version_safe_point() {
     .unwrap();
     assert_eq!(
         hummock_manager.get_min_pinned_version_id().await,
-        HummockVersionId::MAX
+        MAX_HUMMOCK_VERSION_ID
     );
 }
